@@ -179,3 +179,104 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
+
+# Private credentials
+secrets.json
+.env
+*.key
+
+# Python cache and virtual environments
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Archives
+*.zip
+*.rar
+*.7z
+
+# API keys and private configuration
+secrets.json
+.env
+.env.*
+*.key
+credentials.json
+
+# Python environments
+.venv/
+venv/
+env/
+ENV/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# IDE files
+.idea/
+.vscode/
+
+# Jupyter cache
+.ipynb_checkpoints/
+
+# System files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Temporary files
+*.log
+*.tmp
+*.temp
+*.bak
+~$*
+
+# Compressed packages
+*.zip
+*.rar
+*.7z
+
+# Credentials
+secrets.json
+.env
+.env.*
+credentials.json
+*.key
+*.pem
+
+# Python environment
+venv/
+.venv/
+env/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+
+# IDE
+.idea/
+.vscode/
+
+# Generated experiment outputs
+runs/
+
+# Archives and temporary files
+*.zip
+*.rar
+*.7z
+*.log
+*.tmp
+*.bak
+
+# System files
+Thumbs.db
+desktop.ini
+.DS_Store

@@ -1,0 +1,1126 @@
+{
+  "input_id": "CVE_2022_22965",
+  "sentences": {
+    "input_id": "CVE_2022_22965",
+    "raw_text": "A Spring MVC or Spring WebFlux application running on JDK 9+ may be vulnerable to remote code execution (RCE) via data binding. The specific exploit requires the application to run on Tomcat as a WAR deployment. If the application is deployed as a Spring Boot executable jar, i.e. the default, it is not vulnerable to the exploit. However, the nature of the vulnerability is more general, and there may be other ways to exploit it",
+    "sentences": {
+      "E1": "A Spring MVC or Spring WebFlux application running on JDK 9+ may be vulnerable to remote code execution (RCE) via data binding",
+      "E2": "The specific exploit requires the application to run on Tomcat as a WAR deployment",
+      "E3": "If the application is deployed as a Spring Boot executable jar, i.e",
+      "E4": "the default, it is not vulnerable to the exploit",
+      "E5": "However, the nature of the vulnerability is more general, and there may be other ways to exploit it"
+    }
+  },
+  "extraction": {
+    "input_id": "CVE_2022_22965",
+    "preconditions": [],
+    "entry": [
+      {
+        "vector": "data binding",
+        "detail": "Spring MVC or Spring WebFlux application running on JDK 9+",
+        "evidence_ids": [
+          "E1",
+          "E2"
+        ],
+        "confidence": 0.9
+      }
+    ],
+    "vuln_type": [],
+    "behaviors": [
+      {
+        "action": "execute",
+        "target": "remote code",
+        "impact": "code_execution",
+        "evidence_ids": [
+          "E1"
+        ],
+        "confidence": 0.9
+      }
+    ],
+    "relations": [],
+    "impacts": [
+      {
+        "type": "code_execution",
+        "evidence_ids": [
+          "E1"
+        ],
+        "confidence": 0.9
+      }
+    ],
+    "_validation_errors": [],
+    "_used_llm": true
+  },
+  "rerank": {
+    "input_id": "CVE_2022_22965",
+    "candidates": [
+      {
+        "technique_id": "T1210",
+        "score_fused": 0.12784393657893992,
+        "score_text": 0.1628764779455607,
+        "score_graph": 0.08502638601973671,
+        "llm_score": 0.85,
+        "final_score": 0.633353180973682,
+        "reason": "Direct mechanism match explicitly supported by evidence indicating remote code execution via data binding in a Spring MVC or Spring WebFlux application.",
+        "evidence_ids": [
+          "E1",
+          "E2"
+        ]
+      },
+      {
+        "technique_id": "T1068",
+        "score_fused": 0.1065826554591367,
+        "score_text": 0.14571167837414498,
+        "score_graph": 0.05875829411857101,
+        "llm_score": 0.65,
+        "final_score": 0.48697479663774096,
+        "reason": "Strong match; evidence implies exploitation of a software vulnerability for code execution, aligning with the technique's description.",
+        "evidence_ids": [
+          "E1",
+          "E2"
+        ]
+      },
+      {
+        "technique_id": "T1017",
+        "score_fused": 0.15388620262869115,
+        "score_text": 0.19096951538474402,
+        "score_graph": 0.10856215370462652,
+        "llm_score": 0.25,
+        "final_score": 0.22116586078860734,
+        "reason": "Not supported; the evidence does not relate to application deployment software as described in the technique.",
+        "evidence_ids": [
+          "E1",
+          "E2"
+        ]
+      },
+      {
+        "technique_id": "T1610",
+        "score_fused": 0.13025126412146318,
+        "score_text": 0.14608462164445818,
+        "score_graph": 0.11089938270446928,
+        "llm_score": 0.25,
+        "final_score": 0.21407537923643893,
+        "reason": "Not supported; the evidence does not indicate container deployment as described in the technique.",
+        "evidence_ids": [
+          "E1",
+          "E2"
+        ]
+      },
+      {
+        "technique_id": "T1127",
+        "score_fused": 0.12809207399501335,
+        "score_text": 0.10981673517019089,
+        "score_graph": 0.15042859922535193,
+        "llm_score": 0.25,
+        "final_score": 0.213427622198504,
+        "reason": "Not supported; the evidence does not relate to trusted developer utilities as described in the technique.",
+        "evidence_ids": [
+          "E1",
+          "E2"
+        ]
+      },
+      {
+        "technique_id": "T1203",
+        "score_fused": 0.12775906176952165,
+        "score_text": 0.1627084912547746,
+        "score_graph": 0.08504309239865693,
+        "llm_score": 0.25,
+        "final_score": 0.21332771853085647,
+        "reason": "Weak match; while the evidence discusses vulnerabilities, it does not specifically indicate client-side exploitation mechanisms.",
+        "evidence_ids": [
+          "E1",
+          "E2"
+        ]
+      },
+      {
+        "technique_id": "T1595.002",
+        "score_fused": 0.12342105058422025,
+        "score_text": 0.18102703945811877,
+        "score_graph": 0.05301373084945536,
+        "llm_score": 0.25,
+        "final_score": 0.21202631517526604,
+        "reason": "Not supported; the evidence does not indicate vulnerability scanning as described in the technique.",
+        "evidence_ids": [
+          "E1",
+          "E2"
+        ]
+      },
+      {
+        "technique_id": "T1609",
+        "score_fused": 0.11974239126641545,
+        "score_text": 0.08820192689904408,
+        "score_graph": 0.1582918477154249,
+        "llm_score": 0.25,
+        "final_score": 0.21092271737992463,
+        "reason": "Not supported; the evidence does not relate to container administration commands as described in the technique.",
+        "evidence_ids": [
+          "E1",
+          "E2"
+        ]
+      },
+      {
+        "technique_id": "T1548.001",
+        "score_fused": 0.11903526183570551,
+        "score_text": 0.11982318180388349,
+        "score_graph": 0.11807224854126577,
+        "llm_score": 0.25,
+        "final_score": 0.21071057855071162,
+        "reason": "Not supported; the evidence does not indicate setuid/setgid abuse as described in the technique.",
+        "evidence_ids": [
+          "E1",
+          "E2"
+        ]
+      },
+      {
+        "technique_id": "T1189",
+        "score_fused": 0.11592944264419941,
+        "score_text": 0.14583524828274216,
+        "score_graph": 0.0793779024193138,
+        "llm_score": 0.25,
+        "final_score": 0.20977883279325982,
+        "reason": "Not supported; the evidence does not indicate drive-by compromise as described in the technique.",
+        "evidence_ids": [
+          "E1",
+          "E2"
+        ]
+      },
+      {
+        "technique_id": "T1055",
+        "score_fused": 0.11344268044466306,
+        "score_text": 0.10697472458117148,
+        "score_graph": 0.121347959833375,
+        "llm_score": 0.25,
+        "final_score": 0.20903280413339892,
+        "reason": "Not supported; the evidence does not relate to process injection as described in the technique.",
+        "evidence_ids": [
+          "E1",
+          "E2"
+        ]
+      },
+      {
+        "technique_id": "T1204.001",
+        "score_fused": 0.11230185020675963,
+        "score_text": 0.0968364689338929,
+        "score_graph": 0.13120398287359675,
+        "llm_score": 0.25,
+        "final_score": 0.20869055506202788,
+        "reason": "Not supported; the evidence does not indicate user interaction or malicious links as described in the technique.",
+        "evidence_ids": [
+          "E1",
+          "E2"
+        ]
+      },
+      {
+        "technique_id": "T1053.002",
+        "score_fused": 0.10559627164878396,
+        "score_text": 0.09261680245396044,
+        "score_graph": 0.12146006733134607,
+        "llm_score": 0.25,
+        "final_score": 0.20667888149463517,
+        "reason": "Not supported; the evidence does not relate to task scheduling as described in the technique.",
+        "evidence_ids": [
+          "E1",
+          "E2"
+        ]
+      },
+      {
+        "technique_id": "T1028",
+        "score_fused": 0.1045494280322257,
+        "score_text": 0.09342635335240698,
+        "score_graph": 0.11814429708533743,
+        "llm_score": 0.25,
+        "final_score": 0.2063648284096677,
+        "reason": "Not supported; the evidence does not indicate Windows Remote Management exploitation as described in the technique.",
+        "evidence_ids": [
+          "E1",
+          "E2"
+        ]
+      },
+      {
+        "technique_id": "T1522",
+        "score_fused": 0.10425702115027743,
+        "score_text": 0.10919464515961942,
+        "score_graph": 0.09822214736108166,
+        "llm_score": 0.25,
+        "final_score": 0.20627710634508323,
+        "reason": "Not supported; the evidence does not relate to accessing cloud instance metadata as described in the technique.",
+        "evidence_ids": [
+          "E1",
+          "E2"
+        ]
+      },
+      {
+        "technique_id": "T1574",
+        "score_fused": 0.10330569246528876,
+        "score_text": 0.0952956043309423,
+        "score_graph": 0.11309580018504557,
+        "llm_score": null,
+        "final_score": 0.10330569246528876,
+        "reason": null,
+        "evidence_ids": null
+      },
+      {
+        "technique_id": "T1216",
+        "score_fused": 0.10302433690728927,
+        "score_text": 0.0787714858013762,
+        "score_graph": 0.132666710481183,
+        "llm_score": null,
+        "final_score": 0.10302433690728927,
+        "reason": null,
+        "evidence_ids": null
+      },
+      {
+        "technique_id": "T1559.001",
+        "score_fused": 0.1026607898538673,
+        "score_text": 0.08398915107825651,
+        "score_graph": 0.12548168169072493,
+        "llm_score": null,
+        "final_score": 0.1026607898538673,
+        "reason": null,
+        "evidence_ids": null
+      },
+      {
+        "technique_id": "T1055.008",
+        "score_fused": 0.10262584625607113,
+        "score_text": 0.07062462778917536,
+        "score_graph": 0.1417384466044993,
+        "llm_score": null,
+        "final_score": 0.10262584625607113,
+        "reason": null,
+        "evidence_ids": null
+      },
+      {
+        "technique_id": "T1565.003",
+        "score_fused": 0.10071568257232119,
+        "score_text": 0.06504041528095836,
+        "score_graph": 0.14431878703954246,
+        "llm_score": null,
+        "final_score": 0.10071568257232119,
+        "reason": null,
+        "evidence_ids": null
+      },
+      {
+        "technique_id": "T1494",
+        "score_fused": 0.09999705862489083,
+        "score_text": 0.06422906529492685,
+        "score_graph": 0.14371349491706906,
+        "llm_score": null,
+        "final_score": 0.09999705862489083,
+        "reason": null,
+        "evidence_ids": null
+      },
+      {
+        "technique_id": "T1051",
+        "score_fused": 0.09974154792226197,
+        "score_text": 0.07269811556777052,
+        "score_graph": 0.13279463191108487,
+        "llm_score": null,
+        "final_score": 0.09974154792226197,
+        "reason": null,
+        "evidence_ids": null
+      },
+      {
+        "technique_id": "T1055.011",
+        "score_fused": 0.09926101568638002,
+        "score_text": 0.0827588670568088,
+        "score_graph": 0.11943030845585595,
+        "llm_score": null,
+        "final_score": 0.09926101568638002,
+        "reason": null,
+        "evidence_ids": null
+      },
+      {
+        "technique_id": "T1552.005",
+        "score_fused": 0.09910854069559376,
+        "score_text": 0.10371055027127372,
+        "score_graph": 0.09348386232531823,
+        "llm_score": null,
+        "final_score": 0.09910854069559376,
+        "reason": null,
+        "evidence_ids": null
+      },
+      {
+        "technique_id": "T1055.003",
+        "score_fused": 0.09893591696262181,
+        "score_text": 0.05969423760289174,
+        "score_graph": 0.14689796951340303,
+        "llm_score": null,
+        "final_score": 0.09893591696262181,
+        "reason": null,
+        "evidence_ids": null
+      },
+      {
+        "technique_id": "T1216.001",
+        "score_fused": 0.09780364435375664,
+        "score_text": 0.06444682369627187,
+        "score_graph": 0.1385730918240158,
+        "llm_score": null,
+        "final_score": 0.09780364435375664,
+        "reason": null,
+        "evidence_ids": null
+      },
+      {
+        "technique_id": "T1055.002",
+        "score_fused": 0.09766181872574241,
+        "score_text": 0.07219426785324741,
+        "score_graph": 0.12878882534768074,
+        "llm_score": null,
+        "final_score": 0.09766181872574241,
+        "reason": null,
+        "evidence_ids": null
+      },
+      {
+        "technique_id": "T1175",
+        "score_fused": 0.09756760828735546,
+        "score_text": 0.07951248301636103,
+        "score_graph": 0.11963498361857088,
+        "llm_score": null,
+        "final_score": 0.09756760828735546,
+        "reason": null,
+        "evidence_ids": null
+      },
+      {
+        "technique_id": "T1218.012",
+        "score_fused": 0.09630698975866672,
+        "score_text": 0.06524113564974482,
+        "score_graph": 0.1342763670029046,
+        "llm_score": null,
+        "final_score": 0.09630698975866672,
+        "reason": null,
+        "evidence_ids": null
+      },
+      {
+        "technique_id": "T1574.004",
+        "score_fused": 0.09627367791609653,
+        "score_text": 0.08654912583776717,
+        "score_graph": 0.108159241567388,
+        "llm_score": null,
+        "final_score": 0.09627367791609653,
+        "reason": null,
+        "evidence_ids": null
+      },
+      {
+        "technique_id": "T1116",
+        "score_fused": 0.0962407963530139,
+        "score_text": 0.10863038657079387,
+        "score_graph": 0.08109796386461617,
+        "llm_score": null,
+        "final_score": 0.0962407963530139,
+        "reason": null,
+        "evidence_ids": null
+      },
+      {
+        "technique_id": "T1587.004",
+        "score_fused": 0.0954658724917081,
+        "score_text": 0.13082591196737464,
+        "score_graph": 0.05224804646589343,
+        "llm_score": null,
+        "final_score": 0.0954658724917081,
+        "reason": null,
+        "evidence_ids": null
+      },
+      {
+        "technique_id": "T1588.005",
+        "score_fused": 0.09545320695789403,
+        "score_text": 0.1338858249968917,
+        "score_graph": 0.04848000713245241,
+        "llm_score": null,
+        "final_score": 0.09545320695789403,
+        "reason": null,
+        "evidence_ids": null
+      },
+      {
+        "technique_id": "T1055.005",
+        "score_fused": 0.09496620231857072,
+        "score_text": 0.07821521944528159,
+        "score_graph": 0.11543962583036856,
+        "llm_score": null,
+        "final_score": 0.09496620231857072,
+        "reason": null,
+        "evidence_ids": null
+      },
+      {
+        "technique_id": "T1034",
+        "score_fused": 0.0947464469811211,
+        "score_text": 0.1248876071281847,
+        "score_graph": 0.05790725124582113,
+        "llm_score": null,
+        "final_score": 0.0947464469811211,
+        "reason": null,
+        "evidence_ids": null
+      },
+      {
+        "technique_id": "T1565",
+        "score_fused": 0.09403567015391585,
+        "score_text": 0.04657409935933132,
+        "score_graph": 0.1520442566806303,
+        "llm_score": null,
+        "final_score": 0.09403567015391585,
+        "reason": null,
+        "evidence_ids": null
+      },
+      {
+        "technique_id": "T1037.005",
+        "score_fused": 0.09372678541576145,
+        "score_text": 0.11033057301828852,
+        "score_graph": 0.073433267234895,
+        "llm_score": null,
+        "final_score": 0.09372678541576145,
+        "reason": null,
+        "evidence_ids": null
+      },
+      {
+        "technique_id": "T1574.005",
+        "score_fused": 0.09352678121436699,
+        "score_text": 0.09576207106604305,
+        "score_graph": 0.09079476028454068,
+        "llm_score": null,
+        "final_score": 0.09352678121436699,
+        "reason": null,
+        "evidence_ids": null
+      },
+      {
+        "technique_id": "T1546",
+        "score_fused": 0.09329417849784735,
+        "score_text": 0.07444625315039535,
+        "score_graph": 0.11633053170028869,
+        "llm_score": null,
+        "final_score": 0.09329417849784735,
+        "reason": null,
+        "evidence_ids": null
+      },
+      {
+        "technique_id": "T1077",
+        "score_fused": 0.09327812141738533,
+        "score_text": 0.06003268934153091,
+        "score_graph": 0.13391142728787406,
+        "llm_score": null,
+        "final_score": 0.09327812141738533,
+        "reason": null,
+        "evidence_ids": null
+      },
+      {
+        "technique_id": "T1153",
+        "score_fused": 0.09310510099486635,
+        "score_text": 0.08892488002928559,
+        "score_graph": 0.0982142599527984,
+        "llm_score": null,
+        "final_score": 0.09310510099486635,
+        "reason": null,
+        "evidence_ids": null
+      },
+      {
+        "technique_id": "T1218.013",
+        "score_fused": 0.09190209109964234,
+        "score_text": 0.06025183865790115,
+        "score_graph": 0.1305857329728816,
+        "llm_score": null,
+        "final_score": 0.09190209109964234,
+        "reason": null,
+        "evidence_ids": null
+      },
+      {
+        "technique_id": "T1055.014",
+        "score_fused": 0.09146921222308164,
+        "score_text": 0.07423698218133296,
+        "score_graph": 0.11253082671855227,
+        "llm_score": null,
+        "final_score": 0.09146921222308164,
+        "reason": null,
+        "evidence_ids": null
+      },
+      {
+        "technique_id": "T1204",
+        "score_fused": 0.0912821011980311,
+        "score_text": 0.053498006882637686,
+        "score_graph": 0.13746266091684528,
+        "llm_score": null,
+        "final_score": 0.0912821011980311,
+        "reason": null,
+        "evidence_ids": null
+      },
+      {
+        "technique_id": "T1136.001",
+        "score_fused": 0.09119380881026329,
+        "score_text": 0.1034761237151172,
+        "score_graph": 0.0761820905932196,
+        "llm_score": null,
+        "final_score": 0.09119380881026329,
+        "reason": null,
+        "evidence_ids": null
+      },
+      {
+        "technique_id": "T1166",
+        "score_fused": 0.126696017189729,
+        "score_text": 0.12942441546582648,
+        "score_graph": 0.12336130818560985,
+        "llm_score": 0.0,
+        "final_score": 0.0380088051569187,
+        "reason": "Missing from LLM output; fallback applied.",
+        "evidence_ids": []
+      },
+      {
+        "technique_id": "T1046",
+        "score_fused": 0.12520540003891723,
+        "score_text": 0.12162953454868529,
+        "score_graph": 0.12957590230475624,
+        "llm_score": 0.0,
+        "final_score": 0.037561620011675165,
+        "reason": "Missing from LLM output; fallback applied.",
+        "evidence_ids": []
+      },
+      {
+        "technique_id": "T1569.002",
+        "score_fused": 0.1164566556150087,
+        "score_text": 0.06558635415912496,
+        "score_graph": 0.1786314685055333,
+        "llm_score": 0.0,
+        "final_score": 0.03493699668450261,
+        "reason": "Missing from LLM output; fallback applied.",
+        "evidence_ids": []
+      },
+      {
+        "technique_id": "T1059.002",
+        "score_fused": 0.11198157599380856,
+        "score_text": 0.09260789194445973,
+        "score_graph": 0.13566052316523491,
+        "llm_score": 0.0,
+        "final_score": 0.033594472798142566,
+        "reason": "Missing from LLM output; fallback applied.",
+        "evidence_ids": []
+      },
+      {
+        "technique_id": "T1127.002",
+        "score_fused": 0.11179043318841353,
+        "score_text": 0.11162525545999698,
+        "score_graph": 0.11199231707870044,
+        "llm_score": 0.0,
+        "final_score": 0.03353712995652406,
+        "reason": "Missing from LLM output; fallback applied.",
+        "evidence_ids": []
+      }
+    ]
+  },
+  "evidence_pack": {
+    "input_id": "CVE_2022_22965",
+    "budget": 2000,
+    "picked_evidence": {
+      "E1": "A Spring MVC or Spring WebFlux application running on JDK 9+ may be vulnerable to remote code execution (RCE) via data binding",
+      "E2": "The specific exploit requires the application to run on Tomcat as a WAR deployment",
+      "E3": "If the application is deployed as a Spring Boot executable jar, i.e",
+      "E4": "the default, it is not vulnerable to the exploit",
+      "E5": "However, the nature of the vulnerability is more general, and there may be other ways to exploit it"
+    },
+    "paths": {
+      "T1017": [
+        {
+          "path_id": "T1017::P1",
+          "nodes": [
+            "CVE::CVE_2022_22965",
+            "BEHAVIOR::B1",
+            "EVIDENCE::E1",
+            "EVIDENCE::E2",
+            "TECHNIQUE::T1017"
+          ],
+          "edges": [
+            "mentions",
+            "supported_by",
+            "supported_by",
+            "linked_to"
+          ],
+          "score": 0.15388620262869115
+        }
+      ],
+      "T1610": [
+        {
+          "path_id": "T1610::P1",
+          "nodes": [
+            "CVE::CVE_2022_22965",
+            "BEHAVIOR::B1",
+            "EVIDENCE::E1",
+            "EVIDENCE::E2",
+            "TECHNIQUE::T1610"
+          ],
+          "edges": [
+            "mentions",
+            "supported_by",
+            "supported_by",
+            "linked_to"
+          ],
+          "score": 0.13025126412146318
+        }
+      ],
+      "T1127": [
+        {
+          "path_id": "T1127::P1",
+          "nodes": [
+            "CVE::CVE_2022_22965",
+            "BEHAVIOR::B1",
+            "EVIDENCE::E1",
+            "EVIDENCE::E2",
+            "TECHNIQUE::T1127"
+          ],
+          "edges": [
+            "mentions",
+            "supported_by",
+            "supported_by",
+            "linked_to"
+          ],
+          "score": 0.12809207399501335
+        }
+      ],
+      "T1210": [
+        {
+          "path_id": "T1210::P1",
+          "nodes": [
+            "CVE::CVE_2022_22965",
+            "BEHAVIOR::B1",
+            "EVIDENCE::E1",
+            "EVIDENCE::E2",
+            "TECHNIQUE::T1210"
+          ],
+          "edges": [
+            "mentions",
+            "supported_by",
+            "supported_by",
+            "linked_to"
+          ],
+          "score": 0.12784393657893992
+        }
+      ],
+      "T1203": [
+        {
+          "path_id": "T1203::P1",
+          "nodes": [
+            "CVE::CVE_2022_22965",
+            "BEHAVIOR::B1",
+            "EVIDENCE::E1",
+            "EVIDENCE::E2",
+            "TECHNIQUE::T1203"
+          ],
+          "edges": [
+            "mentions",
+            "supported_by",
+            "supported_by",
+            "linked_to"
+          ],
+          "score": 0.12775906176952165
+        }
+      ],
+      "T1166": [
+        {
+          "path_id": "T1166::P1",
+          "nodes": [
+            "CVE::CVE_2022_22965",
+            "BEHAVIOR::B1",
+            "EVIDENCE::E1",
+            "EVIDENCE::E2",
+            "TECHNIQUE::T1166"
+          ],
+          "edges": [
+            "mentions",
+            "supported_by",
+            "supported_by",
+            "linked_to"
+          ],
+          "score": 0.126696017189729
+        }
+      ],
+      "T1046": [
+        {
+          "path_id": "T1046::P1",
+          "nodes": [
+            "CVE::CVE_2022_22965",
+            "BEHAVIOR::B1",
+            "EVIDENCE::E1",
+            "EVIDENCE::E2",
+            "TECHNIQUE::T1046"
+          ],
+          "edges": [
+            "mentions",
+            "supported_by",
+            "supported_by",
+            "linked_to"
+          ],
+          "score": 0.12520540003891723
+        }
+      ],
+      "T1595.002": [
+        {
+          "path_id": "T1595.002::P1",
+          "nodes": [
+            "CVE::CVE_2022_22965",
+            "BEHAVIOR::B1",
+            "EVIDENCE::E1",
+            "EVIDENCE::E2",
+            "TECHNIQUE::T1595.002"
+          ],
+          "edges": [
+            "mentions",
+            "supported_by",
+            "supported_by",
+            "linked_to"
+          ],
+          "score": 0.12342105058422025
+        }
+      ],
+      "T1609": [
+        {
+          "path_id": "T1609::P1",
+          "nodes": [
+            "CVE::CVE_2022_22965",
+            "BEHAVIOR::B1",
+            "EVIDENCE::E1",
+            "EVIDENCE::E2",
+            "TECHNIQUE::T1609"
+          ],
+          "edges": [
+            "mentions",
+            "supported_by",
+            "supported_by",
+            "linked_to"
+          ],
+          "score": 0.11974239126641545
+        }
+      ],
+      "T1548.001": [
+        {
+          "path_id": "T1548.001::P1",
+          "nodes": [
+            "CVE::CVE_2022_22965",
+            "BEHAVIOR::B1",
+            "EVIDENCE::E1",
+            "EVIDENCE::E2",
+            "TECHNIQUE::T1548.001"
+          ],
+          "edges": [
+            "mentions",
+            "supported_by",
+            "supported_by",
+            "linked_to"
+          ],
+          "score": 0.11903526183570551
+        }
+      ],
+      "T1569.002": [
+        {
+          "path_id": "T1569.002::P1",
+          "nodes": [
+            "CVE::CVE_2022_22965",
+            "BEHAVIOR::B1",
+            "EVIDENCE::E1",
+            "EVIDENCE::E2",
+            "TECHNIQUE::T1569.002"
+          ],
+          "edges": [
+            "mentions",
+            "supported_by",
+            "supported_by",
+            "linked_to"
+          ],
+          "score": 0.1164566556150087
+        }
+      ],
+      "T1189": [
+        {
+          "path_id": "T1189::P1",
+          "nodes": [
+            "CVE::CVE_2022_22965",
+            "BEHAVIOR::B1",
+            "EVIDENCE::E1",
+            "EVIDENCE::E2",
+            "TECHNIQUE::T1189"
+          ],
+          "edges": [
+            "mentions",
+            "supported_by",
+            "supported_by",
+            "linked_to"
+          ],
+          "score": 0.11592944264419941
+        }
+      ],
+      "T1055": [
+        {
+          "path_id": "T1055::P1",
+          "nodes": [
+            "CVE::CVE_2022_22965",
+            "BEHAVIOR::B1",
+            "EVIDENCE::E1",
+            "EVIDENCE::E2",
+            "TECHNIQUE::T1055"
+          ],
+          "edges": [
+            "mentions",
+            "supported_by",
+            "supported_by",
+            "linked_to"
+          ],
+          "score": 0.11344268044466306
+        }
+      ],
+      "T1204.001": [
+        {
+          "path_id": "T1204.001::P1",
+          "nodes": [
+            "CVE::CVE_2022_22965",
+            "BEHAVIOR::B1",
+            "EVIDENCE::E1",
+            "EVIDENCE::E2",
+            "TECHNIQUE::T1204.001"
+          ],
+          "edges": [
+            "mentions",
+            "supported_by",
+            "supported_by",
+            "linked_to"
+          ],
+          "score": 0.11230185020675963
+        }
+      ],
+      "T1059.002": [
+        {
+          "path_id": "T1059.002::P1",
+          "nodes": [
+            "CVE::CVE_2022_22965",
+            "BEHAVIOR::B1",
+            "EVIDENCE::E1",
+            "EVIDENCE::E2",
+            "TECHNIQUE::T1059.002"
+          ],
+          "edges": [
+            "mentions",
+            "supported_by",
+            "supported_by",
+            "linked_to"
+          ],
+          "score": 0.11198157599380856
+        }
+      ],
+      "T1127.002": [
+        {
+          "path_id": "T1127.002::P1",
+          "nodes": [
+            "CVE::CVE_2022_22965",
+            "BEHAVIOR::B1",
+            "EVIDENCE::E1",
+            "EVIDENCE::E2",
+            "TECHNIQUE::T1127.002"
+          ],
+          "edges": [
+            "mentions",
+            "supported_by",
+            "supported_by",
+            "linked_to"
+          ],
+          "score": 0.11179043318841353
+        }
+      ],
+      "T1068": [
+        {
+          "path_id": "T1068::P1",
+          "nodes": [
+            "CVE::CVE_2022_22965",
+            "BEHAVIOR::B1",
+            "EVIDENCE::E1",
+            "EVIDENCE::E2",
+            "TECHNIQUE::T1068"
+          ],
+          "edges": [
+            "mentions",
+            "supported_by",
+            "supported_by",
+            "linked_to"
+          ],
+          "score": 0.1065826554591367
+        }
+      ],
+      "T1053.002": [
+        {
+          "path_id": "T1053.002::P1",
+          "nodes": [
+            "CVE::CVE_2022_22965",
+            "BEHAVIOR::B1",
+            "EVIDENCE::E1",
+            "EVIDENCE::E2",
+            "TECHNIQUE::T1053.002"
+          ],
+          "edges": [
+            "mentions",
+            "supported_by",
+            "supported_by",
+            "linked_to"
+          ],
+          "score": 0.10559627164878396
+        }
+      ],
+      "T1028": [
+        {
+          "path_id": "T1028::P1",
+          "nodes": [
+            "CVE::CVE_2022_22965",
+            "BEHAVIOR::B1",
+            "EVIDENCE::E1",
+            "EVIDENCE::E2",
+            "TECHNIQUE::T1028"
+          ],
+          "edges": [
+            "mentions",
+            "supported_by",
+            "supported_by",
+            "linked_to"
+          ],
+          "score": 0.1045494280322257
+        }
+      ],
+      "T1522": [
+        {
+          "path_id": "T1522::P1",
+          "nodes": [
+            "CVE::CVE_2022_22965",
+            "BEHAVIOR::B1",
+            "EVIDENCE::E1",
+            "EVIDENCE::E2",
+            "TECHNIQUE::T1522"
+          ],
+          "edges": [
+            "mentions",
+            "supported_by",
+            "supported_by",
+            "linked_to"
+          ],
+          "score": 0.10425702115027743
+        }
+      ]
+    },
+    "candidates": [
+      {
+        "technique_id": "T1017",
+        "score_fused": 0.15388620262869115,
+        "score_text": 0.19096951538474402,
+        "score_graph": 0.10856215370462652
+      },
+      {
+        "technique_id": "T1610",
+        "score_fused": 0.13025126412146318,
+        "score_text": 0.14608462164445818,
+        "score_graph": 0.11089938270446928
+      },
+      {
+        "technique_id": "T1127",
+        "score_fused": 0.12809207399501335,
+        "score_text": 0.10981673517019089,
+        "score_graph": 0.15042859922535193
+      },
+      {
+        "technique_id": "T1210",
+        "score_fused": 0.12784393657893992,
+        "score_text": 0.1628764779455607,
+        "score_graph": 0.08502638601973671
+      },
+      {
+        "technique_id": "T1203",
+        "score_fused": 0.12775906176952165,
+        "score_text": 0.1627084912547746,
+        "score_graph": 0.08504309239865693
+      },
+      {
+        "technique_id": "T1166",
+        "score_fused": 0.126696017189729,
+        "score_text": 0.12942441546582648,
+        "score_graph": 0.12336130818560985
+      },
+      {
+        "technique_id": "T1046",
+        "score_fused": 0.12520540003891723,
+        "score_text": 0.12162953454868529,
+        "score_graph": 0.12957590230475624
+      },
+      {
+        "technique_id": "T1595.002",
+        "score_fused": 0.12342105058422025,
+        "score_text": 0.18102703945811877,
+        "score_graph": 0.05301373084945536
+      },
+      {
+        "technique_id": "T1609",
+        "score_fused": 0.11974239126641545,
+        "score_text": 0.08820192689904408,
+        "score_graph": 0.1582918477154249
+      },
+      {
+        "technique_id": "T1548.001",
+        "score_fused": 0.11903526183570551,
+        "score_text": 0.11982318180388349,
+        "score_graph": 0.11807224854126577
+      },
+      {
+        "technique_id": "T1569.002",
+        "score_fused": 0.1164566556150087,
+        "score_text": 0.06558635415912496,
+        "score_graph": 0.1786314685055333
+      },
+      {
+        "technique_id": "T1189",
+        "score_fused": 0.11592944264419941,
+        "score_text": 0.14583524828274216,
+        "score_graph": 0.0793779024193138
+      },
+      {
+        "technique_id": "T1055",
+        "score_fused": 0.11344268044466306,
+        "score_text": 0.10697472458117148,
+        "score_graph": 0.121347959833375
+      },
+      {
+        "technique_id": "T1204.001",
+        "score_fused": 0.11230185020675963,
+        "score_text": 0.0968364689338929,
+        "score_graph": 0.13120398287359675
+      },
+      {
+        "technique_id": "T1059.002",
+        "score_fused": 0.11198157599380856,
+        "score_text": 0.09260789194445973,
+        "score_graph": 0.13566052316523491
+      },
+      {
+        "technique_id": "T1127.002",
+        "score_fused": 0.11179043318841353,
+        "score_text": 0.11162525545999698,
+        "score_graph": 0.11199231707870044
+      },
+      {
+        "technique_id": "T1068",
+        "score_fused": 0.1065826554591367,
+        "score_text": 0.14571167837414498,
+        "score_graph": 0.05875829411857101
+      },
+      {
+        "technique_id": "T1053.002",
+        "score_fused": 0.10559627164878396,
+        "score_text": 0.09261680245396044,
+        "score_graph": 0.12146006733134607
+      },
+      {
+        "technique_id": "T1028",
+        "score_fused": 0.1045494280322257,
+        "score_text": 0.09342635335240698,
+        "score_graph": 0.11814429708533743
+      },
+      {
+        "technique_id": "T1522",
+        "score_fused": 0.10425702115027743,
+        "score_text": 0.10919464515961942,
+        "score_graph": 0.09822214736108166
+      }
+    ],
+    "approx_used_tokens": 99
+  },
+  "verify": {
+    "input_id": "CVE_2022_22965",
+    "EVR": 1.0,
+    "PCS": 1.0,
+    "issues": []
+  },
+  "_missing_sections": []
+}
