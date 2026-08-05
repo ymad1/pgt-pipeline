@@ -1,374 +1,668 @@
-# pgt/retrieve_candidates.py
-"""
-Step 6: Retrieve candidate ATT&CK techniques (TEXT + GRAPH).
+"""Retrieve ATT&CK technique candidates from evidence and MES text views.
 
-This "improved baseline" version computes:
-- score_text  : TF-IDF cosine between (raw_text + all split sentences) and technique doc
-- score_graph : TF-IDF cosine between (graph-derived structured query) and technique doc
-and fuses:
-- score_fused = alpha*score_text + (1-alpha)*score_graph
+The retriever implements the candidate-generation stage used by the revised
+pipeline.  It deliberately contains no CVE-, product-, protocol-, or
+technique-specific boosting rules.  Both views are represented in the same
+TF--IDF space built from the ATT&CK technique corpus:
 
-Key improvements vs previous baseline:
-1) Graph query uses ONLY structured node fields (Behavior/VulnType/Entry/Precondition/Impact)
-   -> Evidence text is NOT appended by default (reduces noise).
-2) Simple keyword boosting for domain terms (e.g., JNDI/LDAP/SMB) to increase signal.
-3) Output directory is auto-created to avoid FileNotFoundError.
+* ``score_text``: cosine similarity between the concatenated evidence units of
+  one CVE and an ATT&CK technique document;
+* ``score_structure``: cosine similarity between a deterministic textual
+  rendering of the selected Minimal Explainable Subgraph (MES) and the same
+  technique document;
+* ``score_fused``: ``alpha * score_text + (1-alpha) * score_structure``.
 
-Inputs:
-  --sentences        data/processed/sentences.jsonl        (Step2 output)
-  --local_graph_dir  runs/graphs/<run_id>/local_graphs     (Step4 output)
-  --tech_index       data/attack/technique_text_index.jsonl (Step5 output)
-Output:
-  --output           runs/retrieval/<run_id>/candidates.jsonl
+Raw cosine scores are already bounded in [0, 1].  The default normalization
+therefore performs no per-query rescaling (``none_cosine_shared_space``), which
+avoids changing score meaning according to the other candidates present in a
+query.  A deterministic per-query min--max option is provided only for an
+explicit calibration ablation.
 
-Run example:
-  python -m pgt.retrieve_candidates `
-    --sentences data/processed/sentences.jsonl `
-    --local_graph_dir runs/graphs/dev/local_graphs `
-    --tech_index data/attack/technique_text_index.jsonl `
-    --output runs/retrieval/dev/candidates.jsonl `
-    --topn 50 `
-    --alpha 0.55
+Inputs
+------
+``--sentences``
+    JSONL produced by ``pgt.split_sentences``.  Evidence units are used once;
+    ``raw_text`` is only a fallback when no evidence dictionary is available.
+``--mes``
+    JSONL produced by ``pgt.build_mes``.
+``--tech_index``
+    ATT&CK technique text index, one JSON object per line.
 
-Note:
-- Pure-python TF-IDF cosine (no sklearn dependency).
+Output
+------
+A candidate JSONL file and a ``.summary.json`` sidecar containing the exact
+configuration, input hashes, corpus counts, and MES coverage statistics.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import re
+from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple
+
+RETRIEVAL_VERSION = "candidate-retrieval-v2.0.0"
+DEFAULT_ALPHA = 0.60
+DEFAULT_TOPN = 20
+STRUCTURAL_TYPES: Tuple[str, ...] = (
+    "Precondition",
+    "Entry",
+    "VulnType",
+    "Behavior",
+    "Impact",
+)
+_TYPE_LABEL: Mapping[str, str] = {
+    "Precondition": "precondition",
+    "Entry": "entry",
+    "VulnType": "vulnerability type",
+    "Behavior": "behavior",
+    "Impact": "impact",
+}
+_TOKEN_RE = re.compile(r"[A-Za-z0-9]+")
+_EVIDENCE_ID_RE = re.compile(r"^(?:E|e)(\d+)$")
 
 
-# -----------------------
-# IO helpers
-# -----------------------
+# ---------------------------------------------------------------------------
+# IO and provenance
+# ---------------------------------------------------------------------------
 
-def read_jsonl(path: Path, encoding: str = "utf-8-sig") -> List[Dict[str, Any]]:
-    rows: List[Dict[str, Any]] = []
-    with path.open("r", encoding=encoding) as f:
-        for line_no, line in enumerate(f, start=1):
+
+def read_jsonl(path: Path) -> Iterable[Dict[str, Any]]:
+    with path.open("r", encoding="utf-8-sig") as handle:
+        for line_no, line in enumerate(handle, start=1):
             line = line.strip()
             if not line:
                 continue
             try:
-                rows.append(json.loads(line))
-            except json.JSONDecodeError as e:
-                raise ValueError(f"Invalid JSON on line {line_no} in {path}: {e}") from e
-    return rows
+                row = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"Invalid JSON in {path} at line {line_no}: {exc}") from exc
+            if not isinstance(row, dict):
+                raise ValueError(f"Expected a JSON object in {path} at line {line_no}")
+            yield row
 
 
-def write_jsonl(path: Path, rows: List[Dict[str, Any]], encoding: str = "utf-8") -> None:
+def write_jsonl(path: Path, rows: Iterable[Mapping[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding=encoding, newline="\n") as f:
-        for r in rows:
-            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+    with path.open("w", encoding="utf-8", newline="\n") as handle:
+        for row in rows:
+            handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
 
 
-# -----------------------
-# Tokenization / TF-IDF
-# -----------------------
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
-_TOKEN_RE = re.compile(r"[a-zA-Z0-9]+")  # keep alnum tokens
+
+def sha256_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# Deterministic TF--IDF
+# ---------------------------------------------------------------------------
 
 
 def tokenize(text: str) -> List[str]:
-    text = (text or "").lower()
-    toks = _TOKEN_RE.findall(text)
-    out: List[str] = []
-    for t in toks:
-        if len(t) <= 2:
+    """Tokenize using the documented alphanumeric unigram rule."""
+    tokens: List[str] = []
+    for token in _TOKEN_RE.findall((text or "").lower()):
+        if len(token) <= 2:
             continue
-        # drop tiny pure numbers
-        if t.isdigit() and len(t) <= 3:
+        if token.isdigit() and len(token) <= 3:
             continue
-        out.append(t)
-    return out
+        tokens.append(token)
+    return tokens
 
 
-def build_idf(docs_tokens: List[List[str]]) -> Dict[str, float]:
-    """
-    idf(t) = log((N+1)/(df+1)) + 1
-    """
-    N = len(docs_tokens)
-    df: Dict[str, int] = {}
-    for toks in docs_tokens:
-        for t in set(toks):
-            df[t] = df.get(t, 0) + 1
-
-    idf: Dict[str, float] = {}
-    for t, d in df.items():
-        idf[t] = math.log((N + 1.0) / (d + 1.0)) + 1.0
-    return idf
+def build_idf(documents: Sequence[Sequence[str]]) -> Dict[str, float]:
+    """Smoothed IDF: log((N+1)/(df+1)) + 1."""
+    n_docs = len(documents)
+    if n_docs == 0:
+        raise ValueError("Technique corpus is empty")
+    document_frequency: Counter[str] = Counter()
+    for tokens in documents:
+        document_frequency.update(set(tokens))
+    return {
+        token: math.log((n_docs + 1.0) / (frequency + 1.0)) + 1.0
+        for token, frequency in sorted(document_frequency.items())
+    }
 
 
-def tfidf_vector(tokens: List[str], idf: Dict[str, float]) -> Dict[str, float]:
-    tf: Dict[str, int] = {}
-    for t in tokens:
-        tf[t] = tf.get(t, 0) + 1
-
-    vec: Dict[str, float] = {}
-    for t, c in tf.items():
-        w = idf.get(t)
-        if w is None:
-            continue
-        vec[t] = (1.0 + math.log(c)) * w  # log-tf
-    return vec
+def tfidf_vector(tokens: Sequence[str], idf: Mapping[str, float]) -> Dict[str, float]:
+    term_frequency = Counter(tokens)
+    return {
+        token: (1.0 + math.log(count)) * idf[token]
+        for token, count in term_frequency.items()
+        if token in idf
+    }
 
 
-def dot(a: Dict[str, float], b: Dict[str, float]) -> float:
-    if len(a) > len(b):
-        a, b = b, a
-    s = 0.0
-    for k, v in a.items():
-        bv = b.get(k)
-        if bv is not None:
-            s += v * bv
-    return s
-
-
-def norm(a: Dict[str, float]) -> float:
-    return math.sqrt(sum(v * v for v in a.values()))
-
-
-def cosine(a: Dict[str, float], b: Dict[str, float]) -> float:
-    na = norm(a)
-    nb = norm(b)
-    if na == 0.0 or nb == 0.0:
+def cosine(left: Mapping[str, float], right: Mapping[str, float]) -> float:
+    if not left or not right:
         return 0.0
-    return dot(a, b) / (na * nb)
+    if len(left) > len(right):
+        left, right = right, left
+    numerator = sum(value * right.get(token, 0.0) for token, value in left.items())
+    left_norm = math.sqrt(sum(value * value for value in left.values()))
+    right_norm = math.sqrt(sum(value * value for value in right.values()))
+    if left_norm == 0.0 or right_norm == 0.0:
+        return 0.0
+    score = numerator / (left_norm * right_norm)
+    # Guard against tiny floating-point excursions.
+    return max(0.0, min(1.0, score))
 
 
-# -----------------------
-# Load technique docs
-# -----------------------
+def minmax_normalize(values: Sequence[float]) -> List[float]:
+    if not values:
+        return []
+    low = min(values)
+    high = max(values)
+    if math.isclose(low, high, rel_tol=0.0, abs_tol=1e-15):
+        return [0.0 for _ in values]
+    scale = high - low
+    return [(value - low) / scale for value in values]
 
-def load_technique_index(path: Path) -> Tuple[List[str], List[str]]:
-    """
-    Accepts jsonl with fields like:
-      {"technique_id":"Txxxx", "text":"..."}
-    Or:
-      {"technique_id":"Txxxx", "name":"...", "description":"...", ...}
-    Builds one text document per technique.
-    """
-    rows = read_jsonl(path)
-    tech_ids: List[str] = []
-    docs: List[str] = []
 
-    for r in rows:
-        tid = str(r.get("technique_id", "")).strip()
-        if not tid:
+# ---------------------------------------------------------------------------
+# Technique corpus
+# ---------------------------------------------------------------------------
+
+
+def _technique_text(row: Mapping[str, Any]) -> str:
+    direct = row.get("text")
+    if isinstance(direct, str) and direct.strip():
+        return direct.strip()
+
+    parts: List[str] = []
+    for key in ("name", "description", "tactics", "platforms"):
+        value = row.get(key)
+        if isinstance(value, str) and value.strip():
+            parts.append(value.strip())
+        elif isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+            pieces = [str(item).strip() for item in value if str(item).strip()]
+            if pieces:
+                parts.append(" ".join(pieces))
+    fields = row.get("fields")
+    if isinstance(fields, Mapping):
+        for key in ("name", "description", "text"):
+            value = fields.get(key)
+            if isinstance(value, str) and value.strip():
+                parts.append(value.strip())
+    return "\n".join(parts).strip()
+
+
+def load_technique_index(path: Path) -> Tuple[List[str], List[str], Dict[str, Any]]:
+    """Load and deterministically merge duplicate technique IDs."""
+    by_id: MutableMapping[str, List[str]] = defaultdict(list)
+    source_rows = 0
+    skipped_rows = 0
+    for row in read_jsonl(path):
+        source_rows += 1
+        raw_id = row.get("technique_id") or row.get("id") or row.get("technique")
+        technique_id = str(raw_id or "").strip()
+        text = _technique_text(row)
+        if not technique_id or not text:
+            skipped_rows += 1
             continue
+        if text not in by_id[technique_id]:
+            by_id[technique_id].append(text)
 
-        if isinstance(r.get("text"), str):
-            txt = r["text"]
-        else:
-            parts: List[str] = []
-            for k in ["name", "description", "tactics", "platforms"]:
-                v = r.get(k)
-                if isinstance(v, str) and v.strip():
-                    parts.append(v.strip())
-                elif isinstance(v, list) and v:
-                    parts.append(" ".join(str(x) for x in v))
-            txt = " ".join(parts)
+    technique_ids = sorted(by_id)
+    technique_docs = ["\n".join(by_id[technique_id]) for technique_id in technique_ids]
+    if not technique_ids:
+        raise ValueError(f"No usable techniques found in {path}")
 
-        tech_ids.append(tid)
-        docs.append(txt)
-
-    return tech_ids, docs
+    metadata = {
+        "source_rows": source_rows,
+        "usable_techniques": len(technique_ids),
+        "duplicate_id_rows_merged": sum(max(0, len(texts) - 1) for texts in by_id.values()),
+        "skipped_rows": skipped_rows,
+    }
+    return technique_ids, technique_docs, metadata
 
 
-# -----------------------
-# Graph -> query text (structured only) + boosting
-# -----------------------
-
-def load_local_graph(graph_path: Path) -> Dict[str, Any]:
-    with graph_path.open("r", encoding="utf-8-sig") as f:
-        return json.load(f)
+# ---------------------------------------------------------------------------
+# Query construction
+# ---------------------------------------------------------------------------
 
 
-def graph_to_query_text_structured_only(g: Dict[str, Any]) -> str:
-    """
-    Build a graph-derived query text from structured nodes ONLY:
-      Behavior, VulnType, Entry, Precondition, Impact
-    Evidence text is intentionally excluded to reduce noise.
-
-    Then apply lightweight keyword boosting for high-signal domain terms.
-    """
-    nodes = g.get("nodes") or []
-
-    behavior_parts: List[str] = []
-    vtype_parts: List[str] = []
-    entry_parts: List[str] = []
-    precond_parts: List[str] = []
-    impact_parts: List[str] = []
-
-    for n in nodes:
-        if not isinstance(n, dict):
-            continue
-        t = n.get("type")
-        if t == "Behavior":
-            for k in ["action", "target", "impact"]:
-                v = n.get(k)
-                if isinstance(v, str) and v.strip():
-                    behavior_parts.append(v.strip())
-        elif t == "VulnType":
-            for k in ["type", "subtype"]:
-                v = n.get(k)
-                if isinstance(v, str) and v.strip():
-                    vtype_parts.append(v.strip())
-        elif t == "Entry":
-            for k in ["vector", "detail"]:
-                v = n.get(k)
-                if isinstance(v, str) and v.strip():
-                    entry_parts.append(v.strip())
-        elif t == "Precondition":
-            v = n.get("condition") or n.get("text")
-            if isinstance(v, str) and v.strip():
-                precond_parts.append(v.strip())
-        elif t == "Impact":
-            # our fixed schema: impact_type + detail (or legacy "type")
-            for k in ["impact_type", "detail", "type"]:
-                v = n.get(k)
-                if isinstance(v, str) and v.strip():
-                    impact_parts.append(v.strip())
-
-    base_parts = behavior_parts + vtype_parts + entry_parts + precond_parts + impact_parts
-    q = " ".join(base_parts).strip()
-
-    # ---- keyword boosting ----
-    q_low = q.lower()
-    boost: List[str] = []
-
-    # Log4Shell-ish signals
-    if "jndi" in q_low:
-        boost += ["jndi"] * 4
-    if "ldap" in q_low:
-        boost += ["ldap"] * 4
-    if "log4j" in q_low:
-        boost += ["log4j"] * 4
-    # If we see JNDI/LDAP/log4j signals, bias toward exploitation vocabulary used in ATT&CK docs
-    if ("jndi" in q_low) or ("ldap" in q_low) or ("log4j" in q_low):
-        boost += ["exploit"] * 5
-        boost += ["public"] * 3 + ["facing"] * 3
-        boost += ["application"] * 3
-        boost += ["remote"] * 2 + ["execution"] * 2
-        boost += ["server"] * 2
-    if "endpoint" in q_low:
-        boost += ["endpoint"] * 1
-    if "remote fetch" in q_low:
-        boost += ["remote"] * 2 + ["fetch"] * 2
-    if "code execution" in q_low or "rce" in q_low:
-        boost += ["execute"] * 2 + ["code"] * 2 + ["execution"] * 2
-
-    # EternalBlue-ish signals
-    if "smb" in q_low or "smbv1" in q_low:
-        boost += ["smb"] * 4
-    if "crafted" in q_low and "packet" in q_low:
-        boost += ["crafted"] * 2 + ["packets"] * 2
-    if "remote attackers" in q_low:
-        boost += ["remote"] * 2 + ["attackers"] * 2
-
-    # General exploitation signals
-    if "exploit" in q_low or "exploitation" in q_low:
-        boost += ["exploit"] * 2
-    if "injection" in q_low:
-        boost += ["injection"] * 2
-
-    return (q + " " + " ".join(boost)).strip()
+def _evidence_sort_key(item: Tuple[str, Any]) -> Tuple[int, str]:
+    evidence_id = str(item[0])
+    match = _EVIDENCE_ID_RE.match(evidence_id)
+    return (int(match.group(1)) if match else 10**9, evidence_id)
 
 
-# -----------------------
-# Sentences -> text query
-# -----------------------
+def evidence_query(row: Mapping[str, Any]) -> Tuple[str, str]:
+    """Return evidence text once, plus a provenance label for its source."""
+    sentences = row.get("sentences")
+    if isinstance(sentences, Mapping):
+        fragments = [
+            str(text).strip()
+            for _, text in sorted(sentences.items(), key=_evidence_sort_key)
+            if isinstance(text, str) and text.strip()
+        ]
+        if fragments:
+            return " ".join(fragments), "evidence_units"
 
-def sentences_to_query_text(row: Dict[str, Any]) -> str:
-    raw = str(row.get("raw_text", "") or "")
-    sents = row.get("sentences") or {}
-    sent_text = ""
-    if isinstance(sents, dict):
-        # stable order E1,E2...
-        sent_text = " ".join(str(v) for _, v in sorted(sents.items()))
-    return (raw + " " + sent_text).strip()
+    raw_text = row.get("raw_text")
+    if isinstance(raw_text, str) and raw_text.strip():
+        return raw_text.strip(), "raw_text_fallback"
+    return "", "empty"
 
 
-# -----------------------
-# Main
-# -----------------------
-
-def main() -> None:
-    parser = argparse.ArgumentParser(description="PGT Step6: retrieve candidate techniques (text + graph).")
-    parser.add_argument("--sentences", required=True, help="Step2 sentences.jsonl")
-    parser.add_argument("--local_graph_dir", required=True, help="Step4 local graph directory")
-    parser.add_argument("--tech_index", required=True, help="Step5 technique_text_index.jsonl")
-    parser.add_argument("--output", required=True, help="Output candidates.jsonl")
-    parser.add_argument("--topn", type=int, default=50, help="Top-N candidates per input")
-    parser.add_argument("--alpha", type=float, default=0.55, help="Fusion weight for text score (0..1)")
-    args = parser.parse_args()
-
-    alpha = float(args.alpha)
-    if not (0.0 <= alpha <= 1.0):
-        raise ValueError("--alpha must be within [0,1]")
-
-    sentences_rows = read_jsonl(Path(args.sentences))
-    local_graph_dir = Path(args.local_graph_dir)
-    tech_ids, tech_docs = load_technique_index(Path(args.tech_index))
-
-    # Build TF-IDF model over technique docs
-    tech_tokens = [tokenize(d) for d in tech_docs]
-    idf = build_idf(tech_tokens)
-    tech_vecs = [tfidf_vector(toks, idf) for toks in tech_tokens]
-
-    out_rows: List[Dict[str, Any]] = []
-
-    for row in sentences_rows:
+def load_mes(path: Path) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, int]]:
+    by_input_id: Dict[str, Dict[str, Any]] = {}
+    status_counts: Counter[str] = Counter()
+    for line_no, row in enumerate(read_jsonl(path), start=1):
         input_id = str(row.get("input_id", "")).strip()
         if not input_id:
+            raise ValueError(f"MES record {line_no} is missing input_id")
+        if input_id in by_input_id:
+            raise ValueError(f"Duplicate MES input_id: {input_id}")
+        by_input_id[input_id] = row
+        status_counts[str(row.get("status", "unknown"))] += 1
+    return by_input_id, dict(status_counts)
+
+
+def _node_text(node: Mapping[str, Any]) -> str:
+    value = node.get("text")
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+
+    parts: List[str] = []
+    for key in (
+        "condition",
+        "vector",
+        "detail",
+        "vuln_type",
+        "subtype",
+        "action",
+        "target",
+        "impact",
+        "impact_type",
+    ):
+        value = node.get(key)
+        if isinstance(value, str) and value.strip() and value.strip() not in parts:
+            parts.append(value.strip())
+    return "; ".join(parts)
+
+
+def mes_query(mes: Mapping[str, Any]) -> str:
+    """Render only the retained structural MES path; evidence text is excluded."""
+    raw_nodes = mes.get("nodes") or []
+    node_map: Dict[str, Mapping[str, Any]] = {
+        str(node.get("id")): node
+        for node in raw_nodes
+        if isinstance(node, Mapping) and isinstance(node.get("id"), str)
+    }
+
+    chain = [node_id for node_id in (mes.get("chain") or []) if node_id in node_map]
+    structural_ids = [
+        node_id
+        for node_id in (mes.get("structural_node_ids") or [])
+        if node_id in node_map
+    ]
+
+    ordered_ids: List[str] = []
+    # Optional precondition nodes are retained before the selected main chain.
+    for node_id in structural_ids:
+        if node_map[node_id].get("type") == "Precondition" and node_id not in ordered_ids:
+            ordered_ids.append(node_id)
+    for node_id in chain:
+        if node_id not in ordered_ids:
+            ordered_ids.append(node_id)
+    for node_id in structural_ids:
+        if node_id not in ordered_ids:
+            ordered_ids.append(node_id)
+
+    edge_types: Dict[Tuple[str, str], str] = {}
+    for edge in mes.get("edges") or []:
+        if not isinstance(edge, Mapping):
             continue
+        src = edge.get("src", edge.get("source"))
+        dst = edge.get("dst", edge.get("target"))
+        edge_type = edge.get("type")
+        if isinstance(src, str) and isinstance(dst, str) and isinstance(edge_type, str):
+            if edge_type not in {"mentions", "supported_by"}:
+                edge_types[(src, dst)] = edge_type
 
-        # Text query from Step2 (raw + sentences)
-        q_text = sentences_to_query_text(row)
-        q_text_vec = tfidf_vector(tokenize(q_text), idf)
+    parts: List[str] = []
+    previous_id: Optional[str] = None
+    for node_id in ordered_ids:
+        node = node_map[node_id]
+        node_type = str(node.get("type", ""))
+        if node_type not in STRUCTURAL_TYPES:
+            continue
+        if previous_id is not None:
+            relation = edge_types.get((previous_id, node_id))
+            if relation:
+                parts.append(relation.replace("_", " "))
+        text = _node_text(node)
+        label = _TYPE_LABEL[node_type]
+        parts.append(f"{label} {text}".strip())
+        previous_id = node_id
 
-        # Graph query from Step4 (structured only)
-        g_path = local_graph_dir / f"{input_id}.json"
-        if g_path.exists():
-            g = load_local_graph(g_path)
-            q_graph = graph_to_query_text_structured_only(g)
-        else:
-            q_graph = ""
-        q_graph_vec = tfidf_vector(tokenize(q_graph), idf)
+    if parts:
+        return " ".join(parts).strip()
 
-        scored: List[Tuple[str, float, float, float]] = []
-        for tid, dvec in zip(tech_ids, tech_vecs):
-            s_text = cosine(q_text_vec, dvec)
-            s_graph = cosine(q_graph_vec, dvec)
-            s_fused = alpha * s_text + (1.0 - alpha) * s_graph
-            scored.append((tid, s_fused, s_text, s_graph))
+    # Compatibility fallback for valid older MES records.
+    compact = mes.get("compact_text")
+    if isinstance(compact, str) and compact.strip():
+        return compact.split("| evidence=", 1)[0].strip()
+    return ""
 
-        scored.sort(key=lambda x: x[1], reverse=True)
-        top = scored[: int(args.topn)]
 
-        out_rows.append(
+# ---------------------------------------------------------------------------
+# Ranking
+# ---------------------------------------------------------------------------
+
+
+def to_parent(technique_id: str) -> str:
+    return technique_id.split(".", 1)[0]
+
+
+def _collapse_to_parent(scored: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Collapse sub-techniques after scoring, keeping the best representative."""
+    grouped: MutableMapping[str, List[Dict[str, Any]]] = defaultdict(list)
+    for item in scored:
+        grouped[to_parent(str(item["technique_id"]))].append(item)
+
+    collapsed: List[Dict[str, Any]] = []
+    for parent_id, members in grouped.items():
+        ordered = sorted(
+            members,
+            key=lambda item: (
+                -float(item["score_fused"]),
+                -float(item["score_text"]),
+                -float(item["score_structure"]),
+                str(item["technique_id"]),
+            ),
+        )
+        representative = ordered[0]
+        collapsed.append(
             {
-                "input_id": input_id,
-                "candidates": [
-                    {
-                        "technique_id": tid,
-                        "score_fused": sf,
-                        "score_text": st,
-                        "score_graph": sg,
-                    }
-                    for (tid, sf, st, sg) in top
-                ],
+                "technique_id": parent_id,
+                "score_fused": representative["score_fused"],
+                "score_text": representative["score_text"],
+                "score_structure": representative["score_structure"],
+                # Legacy alias retained temporarily for downstream compatibility.
+                "score_graph": representative["score_structure"],
+                "representative_technique_id": representative["technique_id"],
+                "source_technique_ids": sorted(str(item["technique_id"]) for item in members),
+            }
+        )
+    return collapsed
+
+
+def rank_one(
+    *,
+    query_text: str,
+    query_structure: str,
+    technique_ids: Sequence[str],
+    technique_vectors: Sequence[Mapping[str, float]],
+    idf: Mapping[str, float],
+    alpha: float,
+    normalization: str,
+    parent_normalization: bool,
+    topn: int,
+) -> List[Dict[str, Any]]:
+    text_vector = tfidf_vector(tokenize(query_text), idf)
+    structure_vector = tfidf_vector(tokenize(query_structure), idf)
+
+    raw_text_scores = [cosine(text_vector, vector) for vector in technique_vectors]
+    raw_structure_scores = [cosine(structure_vector, vector) for vector in technique_vectors]
+
+    if normalization == "none":
+        text_scores = raw_text_scores
+        structure_scores = raw_structure_scores
+    elif normalization == "minmax":
+        text_scores = minmax_normalize(raw_text_scores)
+        structure_scores = minmax_normalize(raw_structure_scores)
+    else:  # defensive; argparse also constrains this value
+        raise ValueError(f"Unsupported score normalization: {normalization}")
+
+    scored: List[Dict[str, Any]] = []
+    for technique_id, score_text, score_structure in zip(
+        technique_ids, text_scores, structure_scores
+    ):
+        score_fused = alpha * score_text + (1.0 - alpha) * score_structure
+        scored.append(
+            {
+                "technique_id": technique_id,
+                "score_fused": round(score_fused, 12),
+                "score_text": round(score_text, 12),
+                "score_structure": round(score_structure, 12),
+                # Temporary alias for old evaluation scripts.  New code should
+                # use score_structure because the view is derived from MES text.
+                "score_graph": round(score_structure, 12),
             }
         )
 
-    write_jsonl(Path(args.output), out_rows)
+    if parent_normalization:
+        scored = _collapse_to_parent(scored)
+
+    scored.sort(
+        key=lambda item: (
+            -float(item["score_fused"]),
+            -float(item["score_text"]),
+            -float(item["score_structure"]),
+            str(item["technique_id"]),
+        )
+    )
+    selected = scored[:topn]
+    for rank, item in enumerate(selected, start=1):
+        item["rank"] = rank
+    return selected
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Retrieve ATT&CK candidates using evidence and MES TF-IDF views."
+    )
+    parser.add_argument("--sentences", required=True, help="sentences.jsonl")
+    parser.add_argument("--mes", required=True, help="MES JSONL from pgt.build_mes")
+    parser.add_argument("--tech_index", required=True, help="technique_text_index.jsonl")
+    parser.add_argument("--output", required=True, help="output candidates.jsonl")
+    parser.add_argument("--topn", type=int, default=DEFAULT_TOPN)
+    parser.add_argument("--alpha", type=float, default=DEFAULT_ALPHA)
+    parser.add_argument(
+        "--score_normalization",
+        choices=("none", "minmax"),
+        default="none",
+        help="none = shared cosine scale; minmax = explicit calibration ablation",
+    )
+    parser.add_argument(
+        "--normalize_to_parent",
+        action="store_true",
+        help="collapse sub-techniques to parent IDs after scoring",
+    )
+    parser.add_argument(
+        "--allow_missing_mes",
+        action="store_true",
+        help="allow a sentence record without a matching MES and use a zero structure view",
+    )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="replace an existing output file",
+    )
+    return parser
+
+
+def main(argv: Optional[Sequence[str]] = None) -> None:
+    args = build_arg_parser().parse_args(argv)
+
+    sentences_path = Path(args.sentences)
+    mes_path = Path(args.mes)
+    technique_path = Path(args.tech_index)
+    output_path = Path(args.output)
+    summary_path = Path(str(output_path) + ".summary.json")
+
+    if output_path.exists() and not args.overwrite:
+        raise FileExistsError(f"Output already exists: {output_path}; use --overwrite")
+    if args.topn <= 0:
+        raise ValueError("--topn must be greater than zero")
+    if not 0.0 <= args.alpha <= 1.0:
+        raise ValueError("--alpha must be within [0, 1]")
+
+    technique_ids, technique_docs, technique_metadata = load_technique_index(technique_path)
+    technique_tokens = [tokenize(document) for document in technique_docs]
+    idf = build_idf(technique_tokens)
+    technique_vectors = [tfidf_vector(tokens, idf) for tokens in technique_tokens]
+
+    mes_by_id, mes_file_status_counts = load_mes(mes_path)
+    output_rows: List[Dict[str, Any]] = []
+    runtime_status_counts: Counter[str] = Counter()
+    text_source_counts: Counter[str] = Counter()
+    missing_mes_ids: List[str] = []
+
+    seen_input_ids: set[str] = set()
+    for row in read_jsonl(sentences_path):
+        input_id = str(row.get("input_id", "")).strip()
+        if not input_id:
+            raise ValueError("Sentence record is missing input_id")
+        if input_id in seen_input_ids:
+            raise ValueError(f"Duplicate sentence input_id: {input_id}")
+        seen_input_ids.add(input_id)
+
+        text_query, text_source = evidence_query(row)
+        text_source_counts[text_source] += 1
+
+        mes = mes_by_id.get(input_id)
+        if mes is None:
+            if not args.allow_missing_mes:
+                raise KeyError(
+                    f"No MES record for {input_id}. Use --allow_missing_mes only for a declared ablation."
+                )
+            structure_query = ""
+            mes_status = "missing"
+            complete_core_chain = False
+            mes_sha256 = None
+            missing_mes_ids.append(input_id)
+        else:
+            structure_query = mes_query(mes)
+            mes_status = str(mes.get("status", "unknown"))
+            complete_core_chain = bool(mes.get("complete_core_chain", False))
+            raw_mes_hash = mes.get("mes_sha256")
+            mes_sha256 = str(raw_mes_hash) if raw_mes_hash else None
+        runtime_status_counts[mes_status] += 1
+
+        candidates = rank_one(
+            query_text=text_query,
+            query_structure=structure_query,
+            technique_ids=technique_ids,
+            technique_vectors=technique_vectors,
+            idf=idf,
+            alpha=float(args.alpha),
+            normalization=str(args.score_normalization),
+            parent_normalization=bool(args.normalize_to_parent),
+            topn=int(args.topn),
+        )
+
+        output_rows.append(
+            {
+                "input_id": input_id,
+                "candidates": candidates,
+                "retrieval_metadata": {
+                    "version": RETRIEVAL_VERSION,
+                    "alpha": float(args.alpha),
+                    "score_normalization": (
+                        "none_cosine_shared_space"
+                        if args.score_normalization == "none"
+                        else "per_query_minmax"
+                    ),
+                    "text_query_source": text_source,
+                    "text_query_sha256": sha256_text(text_query),
+                    "structure_query_sha256": sha256_text(structure_query),
+                    "structure_query_empty": not bool(structure_query),
+                    "mes_status": mes_status,
+                    "complete_core_chain": complete_core_chain,
+                    "mes_sha256": mes_sha256,
+                    "parent_normalization": bool(args.normalize_to_parent),
+                },
+            }
+        )
+
+    write_jsonl(output_path, output_rows)
+
+    summary = {
+        "version": RETRIEVAL_VERSION,
+        "configuration": {
+            "alpha": float(args.alpha),
+            "topn": int(args.topn),
+            "score_normalization": (
+                "none_cosine_shared_space"
+                if args.score_normalization == "none"
+                else "per_query_minmax"
+            ),
+            "parent_normalization": bool(args.normalize_to_parent),
+            "allow_missing_mes": bool(args.allow_missing_mes),
+            "tokenization": "lowercase_alphanumeric_unigrams_len_gt_2",
+            "tf": "1_plus_log_count",
+            "idf": "log((N+1)/(df+1))+1_over_technique_corpus",
+            "text_view": "ordered_evidence_units_once_raw_text_only_as_fallback",
+            "structure_view": "deterministic_text_rendering_of_selected_mes_structural_path",
+            "heuristic_boosting": False,
+        },
+        "inputs": {
+            "sentences": str(sentences_path),
+            "sentences_sha256": sha256_file(sentences_path),
+            "mes": str(mes_path),
+            "mes_sha256": sha256_file(mes_path),
+            "tech_index": str(technique_path),
+            "tech_index_sha256": sha256_file(technique_path),
+        },
+        "counts": {
+            "sentence_records": len(output_rows),
+            "technique_corpus": technique_metadata,
+            "mes_status_in_file": mes_file_status_counts,
+            "mes_status_used": dict(sorted(runtime_status_counts.items())),
+            "text_query_sources": dict(sorted(text_source_counts.items())),
+            "missing_mes_count": len(missing_mes_ids),
+            "empty_structure_query_count": sum(
+                1
+                for row in output_rows
+                if row["retrieval_metadata"]["structure_query_empty"]
+            ),
+        },
+        "missing_mes_ids": missing_mes_ids,
+        "output": {
+            "path": str(output_path),
+            "sha256": sha256_file(output_path),
+        },
+    }
+    summary_path.parent.mkdir(parents=True, exist_ok=True)
+    summary_path.write_text(
+        json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    print(
+        json.dumps(
+            {
+                "records": len(output_rows),
+                "techniques": len(technique_ids),
+                "mes_status": dict(sorted(runtime_status_counts.items())),
+                "missing_mes": len(missing_mes_ids),
+                "output": str(output_path),
+                "summary": str(summary_path),
+            },
+            ensure_ascii=False,
+        )
+    )
 
 
 if __name__ == "__main__":
