@@ -36,7 +36,7 @@ if str(_REPOSITORY_ROOT) not in sys.path:
 from pgt.io import read_jsonl as validated_read_jsonl
 from pgt.io import write_jsonl as validated_write_jsonl
 
-SCRIPT_VERSION = "reviewer2-pipeline-v1.2.0"
+SCRIPT_VERSION = "reviewer2-pipeline-v1.2.1"
 DEFAULT_CONFIG_NAME = "pipeline_config.json"
 STAGE_ORDER = (
     "data",
@@ -293,6 +293,14 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "reference_method": "full",
         "include_retrieval_baseline": True,
         "retrieval_method_name": "retrieval",
+    },
+    "semantic_audit": {
+        "enabled": False,
+        "audit_csv": "data/audit/ai_assisted_label_audit_completed.csv",
+        "subsets": "audited_all,directly_supported,supported_or_plausible",
+        "min_cves": 20,
+        "bootstrap_repetitions": 5000,
+        "permutation_repetitions": 20000,
     },
 }
 
@@ -1242,6 +1250,19 @@ def stage_evaluate(runner: PipelineRunner) -> None:
 
 def stage_audit(runner: PipelineRunner) -> None:
     p = runner.paths
+    evaluation_ks = {
+        int(value.strip())
+        for value in str(runner.config["evaluation"]["ks"]).split(",")
+        if value.strip()
+    }
+    selected_retrieval_path = p.retrieval_selection / "selected_retrieval.json"
+    if selected_retrieval_path.is_file():
+        selected_topn = int(_selected_retrieval(selected_retrieval_path)["topn"])
+    elif runner.plan_only:
+        selected_topn = int(runner.config["retrieval"]["fallback_topn_for_plan"])
+    else:
+        raise FileNotFoundError(selected_retrieval_path)
+    audit_ks = sorted(evaluation_ks | {selected_topn})
     command = [
         runner.python,
         "-m",
@@ -1258,6 +1279,8 @@ def stage_audit(runner: PipelineRunner) -> None:
         str(p.inputs / "test" / "ids.txt"),
         "--output_dir",
         str(p.audit / "test_candidate_coverage"),
+        "--ks",
+        ",".join(str(value) for value in audit_ks),
     ]
     runner.run_command(
         stage="audit",
@@ -1269,6 +1292,93 @@ def stage_audit(runner: PipelineRunner) -> None:
             p.audit / "test_candidate_coverage" / "audit_manifest.json",
         ],
     )
+
+    semantic_manifest: Optional[Path] = None
+    semantic_cfg = runner.config.get("semantic_audit", {})
+    if bool(semantic_cfg.get("enabled", False)):
+        audit_csv = _resolve(runner.root, str(semantic_cfg["audit_csv"]))
+        semantic_tool = runner.root / "tools" / "evaluate_semantic_subsets.py"
+        sensitivity_builder = runner.root / "tools" / "build_audit_sensitivity_labels.py"
+        missing = [
+            path
+            for path in (audit_csv, semantic_tool, sensitivity_builder)
+            if not path.is_file()
+        ]
+        if missing:
+            raise FileNotFoundError(
+                f"Semantic sensitivity evaluation is enabled but files are missing: {missing}"
+            )
+        semantic_output = p.workspace / "evaluation" / "semantic_sensitivity"
+        eval_cfg = runner.config["evaluation"]
+        rerank_cfg = runner.config["reranking"]
+        semantic_command = [
+            runner.python,
+            str(semantic_tool),
+            "--labels",
+            str(p.inputs / "test" / "labels.jsonl"),
+            "--audit_csv",
+            str(audit_csv),
+            "--rerank_root",
+            str(p.rerank_test),
+            "--output_dir",
+            str(semantic_output),
+            "--modes",
+            ",".join(str(value) for value in rerank_cfg["test_modes"]),
+            "--seeds",
+            ",".join(str(int(value)) for value in rerank_cfg["seeds"]),
+            "--subsets",
+            str(semantic_cfg["subsets"]),
+            "--min_cves",
+            str(int(semantic_cfg["min_cves"])),
+            "--ks",
+            str(eval_cfg["ks"]),
+            "--bootstrap_repetitions",
+            str(
+                int(
+                    semantic_cfg.get(
+                        "bootstrap_repetitions", eval_cfg["bootstrap_repetitions"]
+                    )
+                )
+            ),
+            "--permutation_repetitions",
+            str(
+                int(
+                    semantic_cfg.get(
+                        "permutation_repetitions", eval_cfg["permutation_repetitions"]
+                    )
+                )
+            ),
+            "--confidence",
+            str(eval_cfg["confidence"]),
+            "--seed",
+            str(eval_cfg["seed"]),
+            "--tail_max_support",
+            str(eval_cfg["tail_max_support"]),
+            "--head_min_support",
+            str(eval_cfg["head_min_support"]),
+            "--reference_method",
+            str(eval_cfg["reference_method"]),
+            "--retrieval_method_name",
+            str(eval_cfg.get("retrieval_method_name", "retrieval")),
+        ]
+        if eval_cfg.get("parent", False):
+            semantic_command.append("--parent")
+        if eval_cfg.get("include_retrieval_baseline", False):
+            semantic_command.append("--include_retrieval_baseline")
+        else:
+            semantic_command.append("--no-include_retrieval_baseline")
+        if runner.overwrite:
+            semantic_command.append("--overwrite")
+        semantic_manifest = semantic_output / "semantic_evaluation_manifest.json"
+        runner.run_command(
+            stage="audit",
+            name="semantic_label_sensitivity",
+            command=semantic_command,
+            expected_outputs=[
+                semantic_output / "semantic_evaluation_summary.json",
+                semantic_manifest,
+            ],
+        )
 
     def final_manifest() -> None:
         required = [
@@ -1283,6 +1393,8 @@ def stage_audit(runner: PipelineRunner) -> None:
             p.evaluation / "evaluation_manifest.json",
             p.audit / "test_candidate_coverage" / "audit_manifest.json",
         ]
+        if semantic_manifest is not None:
+            required.append(semantic_manifest)
         missing = [path for path in required if not path.exists()]
         if missing:
             raise FileNotFoundError(f"Cannot finalize pipeline; missing artifacts: {missing}")
@@ -1295,6 +1407,8 @@ def stage_audit(runner: PipelineRunner) -> None:
             "eligible_for_formal_reporting": runner.smoke_records_per_split == 0,
             "selected_retrieval": _selected_retrieval(p.retrieval_selection / "selected_retrieval.json"),
             "selected_beta": _selected_beta(p.beta / "selected_beta.json"),
+            "candidate_audit_ks": audit_ks,
+            "semantic_audit_enabled": semantic_manifest is not None,
             "artifacts": _path_metadata(required),
         }
         _write_json_atomic(p.workspace / "final_run_manifest.json", payload)
@@ -1383,6 +1497,31 @@ def _validate_config(config: Mapping[str, Any]) -> None:
             "reranking.test_modes must include all four controlled modes; "
             f"missing: {missing_test}"
         )
+
+    semantic = config.get("semantic_audit", {})
+    if bool(semantic.get("enabled", False)):
+        if not str(semantic.get("audit_csv", "")).strip():
+            raise ValueError("semantic_audit.audit_csv must be configured when enabled.")
+        if int(semantic.get("min_cves", 0)) < 1:
+            raise ValueError("semantic_audit.min_cves must be at least 1.")
+        allowed_subsets = {
+            "audited_all",
+            "directly_supported",
+            "supported_or_plausible",
+            "insufficient_or_unsupported",
+        }
+        configured_subsets = {
+            value.strip()
+            for value in str(semantic.get("subsets", "")).split(",")
+            if value.strip()
+        }
+        if not configured_subsets:
+            raise ValueError("semantic_audit.subsets cannot be empty when enabled.")
+        unknown_subsets = sorted(configured_subsets - allowed_subsets)
+        if unknown_subsets:
+            raise ValueError(
+                f"Unknown semantic_audit subsets in configuration: {unknown_subsets}"
+            )
 
     evaluation = config["evaluation"]
     if evaluation.get("include_retrieval_baseline", False):

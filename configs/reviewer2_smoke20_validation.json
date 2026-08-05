@@ -79,6 +79,15 @@
     "max_evidence": 12,
     "min_chars": 24
   },
+  "semantic_audit": {
+    "audit_csv": "data/audit/ai_assisted_label_audit_completed.csv",
+    "bootstrap_repetitions": 1000,
+    "enabled": false,
+    "min_cves": 20,
+    "permutation_repetitions": 5000,
+    "subsets": "audited_all,directly_supported,supported_or_plausible"
+  },
+  "smoke_workspace": "runs/reviewer2_v2_smoke20",
   "split": {
     "dev_fraction": 0.2,
     "dev_size": null,
@@ -86,5 +95,5 @@
     "min_support_both": 2,
     "seed": 20260805
   },
-  "workspace": "runs/reviewer2_v2_smoke20"
+  "workspace": "runs/reviewer2_v2"
 }
