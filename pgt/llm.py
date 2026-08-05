@@ -14,8 +14,8 @@ RE_ALL = re.compile
 # ---- debug: log only once for the first real OpenAI API call ----
 _OPENAI_FIRST_CALL_LOGGED = False
 
-EXTRACTION_PIPELINE_VERSION = "llm-extraction-v2.0.0"
-PROMPT_VERSION = "cve-extraction-prompt-v2.0.0"
+EXTRACTION_PIPELINE_VERSION = "llm-extraction-v2.1.0"
+PROMPT_VERSION = "cve-extraction-prompt-v2.1.0"
 DEFAULT_MODEL = "gpt-4o-mini-2024-07-18"
 DEFAULT_TEMPERATURE = 0.0
 DEFAULT_SEED = 20260805
@@ -603,6 +603,115 @@ def _detect_impact_types(text: Any) -> set[str]:
     return out
 
 
+# Explicit terminal consequences that may be recovered deterministically from
+# the original evidence text when the model encodes the consequence only as a
+# Behavior target (for example, action="execute", target="arbitrary code").
+# These patterns are generic outcome phrases, not CVE-, product-, protocol-,
+# or ATT&CK-technique-specific rules.
+_EXPLICIT_IMPACT_PATTERNS: Tuple[Tuple[str, re.Pattern[str]], ...] = (
+    (
+        "code_execution",
+        re.compile(
+            r"\b(?:remote\s+code\s+execution|arbitrary\s+code\s+execution|"
+            r"execute(?:s|d|ing)?\s+arbitrary\s+(?:native\s+)?code|"
+            r"execute(?:s|d|ing)?\s+arbitrary\s+(?:os\s+)?commands?|"
+            r"command\s+execution)\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "privilege_escalation",
+        re.compile(
+            r"\b(?:privilege\s+escalation|elevation\s+of\s+privilege|"
+            r"gain(?:s|ed|ing)?\s+(?:root|administrator|admin|system|elevated|higher)\s+privileges?|"
+            r"obtain(?:s|ed|ing)?\s+(?:root|administrator|admin|system|elevated|higher)\s+privileges?|"
+            r"execute(?:s|d|ing)?\s+with\s+(?:root|administrator|admin|system|elevated|higher)\s+privileges?)\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "information_disclosure",
+        re.compile(
+            r"\b(?:information\s+disclosure|disclos(?:e|es|ed|ing)\s+(?:sensitive|confidential|arbitrary)\s+(?:information|data)|"
+            r"expos(?:e|es|ed|ing)\s+(?:sensitive|confidential)\s+(?:information|data)|"
+            r"read(?:s|ing)?\s+arbitrary\s+files?|leak(?:s|ed|ing)?\s+(?:sensitive|confidential)\s+(?:information|data))\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "integrity_violation",
+        re.compile(
+            r"\b(?:(?:modify|overwrite|delete|write)(?:s|d|ing)?\s+arbitrary\s+(?:files?|data)|"
+            r"tamper(?:s|ed|ing)?\s+with\s+(?:files?|data)|"
+            r"data\s+(?:modification|destruction|corruption))\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "bypass",
+        re.compile(
+            r"\b(?:bypass|bypasses|bypassed|bypassing|circumvent|circumvents|circumvented|circumventing)\s+"
+            r"(?:authentication|authorization|security|access\s+controls?|filters?)\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "unauthorized_access",
+        re.compile(
+            r"\b(?:gain(?:s|ed|ing)?\s+unauthorized\s+access|account\s+takeover|take\s+over\s+(?:an\s+)?account)\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "denial_of_service",
+        re.compile(
+            r"\b(?:denial\s+of\s+service|DoS|"
+            r"caus(?:e|es|ed|ing)\s+(?:a\s+)?(?:crash|hang|panic|resource\s+exhaustion))\b",
+            re.IGNORECASE,
+        ),
+    ),
+)
+
+_UNKNOWN_IMPACT_RE = re.compile(
+    r"\b(?:unknown|unspecified|undetermined)\s+(?:security\s+)?impacts?\b|"
+    r"\bimpacts?\s+(?:is|are|remains?|was|were)\s+(?:unknown|unspecified|undetermined)\b",
+    re.IGNORECASE,
+)
+
+
+def _explicit_impacts_from_evidence(
+    evidence_texts: Optional[Dict[str, str]],
+    valid_ids: set[str],
+) -> List[Tuple[str, List[str]]]:
+    """Return explicitly stated terminal consequences in evidence order.
+
+    The function never maps an outcome to an ATT&CK technique.  It only
+    normalizes literal consequence phrases already present in the CVE text.
+    Evidence units whose impact is explicitly unknown/unspecified are ignored.
+    """
+    if not evidence_texts:
+        return []
+
+    by_type: Dict[str, List[str]] = {}
+    order: List[str] = []
+    for evidence_id, raw_text in evidence_texts.items():
+        if evidence_id not in valid_ids or not isinstance(raw_text, str):
+            continue
+        text = raw_text.strip()
+        if not text or _UNKNOWN_IMPACT_RE.search(text):
+            continue
+        for impact_type, pattern in _EXPLICIT_IMPACT_PATTERNS:
+            if not pattern.search(text):
+                continue
+            if impact_type not in by_type:
+                by_type[impact_type] = []
+                order.append(impact_type)
+            if evidence_id not in by_type[impact_type]:
+                by_type[impact_type].append(evidence_id)
+
+    return [(impact_type, by_type[impact_type]) for impact_type in order]
+
+
 _NODE_REF_RE = re.compile(r"^(P|EN|VT|B|I)(\d+)$", re.IGNORECASE)
 _RELATION_PREFIX_BY_FIELD = {
     "preconditions": "P",
@@ -715,14 +824,20 @@ def _sanitize_relations(
     return out
 
 
-def _sanitize_evidence_ids(extraction: Dict[str, Any], valid_ids: set[str]) -> Dict[str, Any]:
+def _sanitize_evidence_ids(
+    extraction: Dict[str, Any],
+    valid_ids: set[str],
+    evidence_texts: Optional[Dict[str, str]] = None,
+) -> Dict[str, Any]:
     """
     Sanitize an extraction dict:
     - Keep only items whose evidence_ids intersect valid_ids
     - Clamp confidence into [0,1]
     - Normalize kind-specific fields
     - Preserve behaviors.impact = None (JSON null) instead of coercing to "unspecified"
-    - Build impacts from signals if present, but do NOT inject a forced "unspecified" impact
+    - Recover only explicitly stated terminal consequences from the original evidence text
+    - Build B->I relations only when Behavior and Impact share direct evidence
+    - Do NOT inject a forced "unspecified" impact
     """
 
     def _clamp_conf(v: Any, default: float = 0.8) -> float:
@@ -855,8 +970,11 @@ def _sanitize_evidence_ids(extraction: Dict[str, Any], valid_ids: set[str]) -> D
         beh = extraction.get("behaviors") or []
         ent = extraction.get("entry") or []
 
-        # collect signals from behaviors + entry.detail
+        # collect signals from model fields and from literal terminal-consequence
+        # phrases in the original evidence units.  Evidence-derived signals are
+        # deliberately generic and require an explicit textual outcome.
         signals: List[Tuple[str, List[str]]] = []
+        signals.extend(_explicit_impacts_from_evidence(evidence_texts, valid_ids))
 
         # behaviors: use impact + detect from action/target
         for b in beh:
@@ -905,11 +1023,65 @@ def _sanitize_evidence_ids(extraction: Dict[str, Any], valid_ids: set[str]) -> D
                 continue
             if t in existing_types:
                 continue
-            impacts.append({"type": t, "evidence_ids": eids, "confidence": 0.8})
+            impacts.append({"type": t, "evidence_ids": eids, "confidence": 0.95})
             existing_types.add(t)
+
+        # If the model represented a literal terminal consequence as a Behavior
+        # target (for example action="execute", target="arbitrary code"), fill
+        # Behavior.impact only when the same evidence unit explicitly states the
+        # consequence.  This is normalization, not inference.
+        explicit_by_type = {
+            impact_type: set(evidence_ids)
+            for impact_type, evidence_ids in _explicit_impacts_from_evidence(
+                evidence_texts, valid_ids
+            )
+        }
+        for behavior in beh:
+            if not isinstance(behavior, dict) or behavior.get("impact") is not None:
+                continue
+            behavior_eids = _filter_eids(behavior.get("evidence_ids"))
+            for impact_type, impact_eids in explicit_by_type.items():
+                if any(eid in impact_eids for eid in behavior_eids):
+                    behavior["impact"] = impact_type
+                    break
+
+        # Complete explicit B->I links when both endpoints cite the same evidence.
+        # No relation is added merely because a Behavior and Impact coexist.
+        relations = extraction.get("relations") or []
+        if not isinstance(relations, list):
+            relations = []
+        existing_relation_keys = {
+            (str(rel.get("src")), str(rel.get("type")), str(rel.get("dst")))
+            for rel in relations
+            if isinstance(rel, dict)
+        }
+        for b_index, behavior in enumerate(beh, start=1):
+            if not isinstance(behavior, dict):
+                continue
+            behavior_eids = _filter_eids(behavior.get("evidence_ids"))
+            for i_index, impact in enumerate(impacts, start=1):
+                if not isinstance(impact, dict):
+                    continue
+                impact_eids = _filter_eids(impact.get("evidence_ids"))
+                shared = [eid for eid in behavior_eids if eid in set(impact_eids)]
+                key = (f"B{b_index}", "causes", f"I{i_index}")
+                if not shared or key in existing_relation_keys:
+                    continue
+                relations.append({
+                    "src": key[0],
+                    "type": key[1],
+                    "dst": key[2],
+                    "evidence_ids": shared,
+                    "confidence": min(
+                        _clamp_conf(behavior.get("confidence", 0.8)),
+                        _clamp_conf(impact.get("confidence", 0.8)),
+                    ),
+                })
+                existing_relation_keys.add(key)
 
         # IMPORTANT: do NOT inject a default "unspecified" if still empty
         extraction["impacts"] = impacts
+        extraction["relations"] = relations
 
     except Exception:
         # keep whatever impacts we already had
@@ -937,19 +1109,27 @@ def _build_messages(input_id: str, sentences: Dict[str, str]) -> List[Dict[str, 
         "put product/version context in entry.detail.\n"
         "6) behaviors must be atomic: action is a concise verb phrase, target is the acted-on object "
         "or null, and impact is a short supported outcome or null.\n"
-        "7) Do not use the literal category 'unspecified'; use an empty list instead.\n"
-        "8) Preserve narrative order within each array.\n"
+        "7) A terminal consequence explicitly stated in the evidence MUST also appear in impacts. "
+        "Examples include arbitrary-code or command execution, privilege escalation, information disclosure, "
+        "denial of service, arbitrary file/data modification or deletion, security bypass, and unauthorized access.\n"
+        "8) Keep action, target, and terminal consequence distinct. For example, in 'execute arbitrary code', "
+        "use a Behavior such as action='execute', target='arbitrary code', impact='code_execution', and also "
+        "emit an Impact with type='code_execution'.\n"
+        "9) If the text says the impact is unknown, unspecified, or undetermined, do not invent an Impact.\n"
+        "10) Do not use the literal category 'unspecified'; use an empty list instead.\n"
+        "11) Preserve narrative order within each array.\n"
         "\n"
         "Relation rules:\n"
-        "9) Refer to extracted items by their output position: P1/P2 for preconditions, "
+        "12) Refer to extracted items by their output position: P1/P2 for preconditions, "
         "EN1/EN2 for entries, VT1/VT2 for vulnerability types, B1/B2 for behaviors, "
         "and I1/I2 for impacts.\n"
-        "10) Emit a relation only when the evidence directly supports the link. Allowed layer links are "
+        "13) Emit a relation only when the evidence directly supports the link. Allowed layer links are "
         "P->EN, P->B, EN->VT, EN->B, VT->B, and B->I.\n"
-        "11) Use relation type 'enables' for P->EN, P->B, EN->B, and VT->B; "
+        "14) Use relation type 'enables' for P->EN, P->B, EN->B, and VT->B; "
         "'characterized_by' for EN->VT; and 'causes' for B->I.\n"
-        "12) Relation evidence_ids must support the connection, not merely one endpoint.\n"
-        "13) Confidence values must be between 0 and 1.\n"
+        "15) When a Behavior and an Impact are directly linked by the same evidence, emit B->I with type 'causes'.\n"
+        "16) Relation evidence_ids must support the connection, not merely one endpoint.\n"
+        "17) Confidence values must be between 0 and 1.\n"
     ).replace("\n\n", "\n")
 
     user = (
@@ -1000,7 +1180,7 @@ def call_llm_extract(input_id: str, sentences: Dict[str, str]) -> Dict[str, Any]
         openai_runtime = get_openai_runtime_config()
         client = get_openai_client()
     except Exception as e:
-        fb = _sanitize_evidence_ids(_rule_based_extract(input_id, sentences), valid_ids)
+        fb = _sanitize_evidence_ids(_rule_based_extract(input_id, sentences), valid_ids, sentences)
         fb["_used_llm"] = False
         fb["_runtime_errors"] = [f"llm_client_init_failed: {type(e).__name__}: {e}"]
         fb["_provenance"] = {
@@ -1037,7 +1217,7 @@ def call_llm_extract(input_id: str, sentences: Dict[str, str]) -> Dict[str, Any]
                 "_validation_errors": [],
                 "_used_llm": True,
             }
-            extraction = _sanitize_evidence_ids(extraction, valid_ids)
+            extraction = _sanitize_evidence_ids(extraction, valid_ids, sentences)
             extraction["_provenance"] = {
                 **base_provenance,
                 "openai_runtime": openai_runtime,
@@ -1054,7 +1234,7 @@ def call_llm_extract(input_id: str, sentences: Dict[str, str]) -> Dict[str, Any]
             if attempt < max_attempts:
                 time.sleep(retry_base * attempt)
 
-    fb = _sanitize_evidence_ids(_rule_based_extract(input_id, sentences), valid_ids)
+    fb = _sanitize_evidence_ids(_rule_based_extract(input_id, sentences), valid_ids, sentences)
     fb["_used_llm"] = False
     fb["_runtime_errors"] = (
         [f"llm_failed: {type(last_err).__name__}: {last_err}"] if last_err else []
