@@ -81,7 +81,7 @@ SCHEMA_VERSIONS: Dict[RecordKind, str] = {
     "sentences": "sentences-contract-v2.0.0",
     "extraction": "extraction-contract-v2.0.0",
     "local_graph": "local-graph-contract-v2.0.0",
-    "mes": "mes-contract-v2.0.0",
+    "mes": "mes-contract-v2.0.1",
     "candidates": "candidate-contract-v2.0.0",
     "reranking": "reranking-contract-v2.0.0",
 }
@@ -169,6 +169,8 @@ class ExtractionRecord(TypedDict):
     impacts: List[ImpactRecord]
     _used_llm: NotRequired[bool]
     _validation_errors: NotRequired[List[str]]
+    _runtime_errors: NotRequired[List[str]]
+    _fallback_warnings: NotRequired[List[str]]
     _provenance: NotRequired[Dict[str, Any]]
 
 
@@ -642,6 +644,10 @@ def validate_extraction_record(
         _err(errors, "root._used_llm", "type", "must be boolean when present")
     if "_validation_errors" in record:
         _validate_string_list(record.get("_validation_errors"), "root._validation_errors", errors)
+    if "_runtime_errors" in record:
+        _validate_string_list(record.get("_runtime_errors"), "root._runtime_errors", errors)
+    if "_fallback_warnings" in record:
+        _validate_string_list(record.get("_fallback_warnings"), "root._fallback_warnings", errors)
     if "_provenance" in record and not _is_mapping(record.get("_provenance")):
         _err(errors, "root._provenance", "type", "must be an object when present")
     return errors
@@ -908,23 +914,78 @@ def validate_mes_record(
             _err(errors, "root.nodes", "cve_count", f"non-empty MES must contain exactly one CVE node, got {cve_count}")
         _validate_nonempty_string(record.get("compact_text"), "root.compact_text", errors)
 
+    # ``chain`` is the ordered primary structural path selected by the MES
+    # algorithm.  Every adjacent pair must therefore be connected by an
+    # existing structural edge in the MES.  This check applies to both complete
+    # and partial records and is stronger than merely checking that the required
+    # node types are present.
+    structural_edges = {
+        (str(edge.get("src")), str(edge.get("type")), str(edge.get("dst")))
+        for edge in edges
+        if edge.get("type") in STRUCTURAL_EDGE_TYPES
+    }
+    structural_pairs = {(src, dst) for src, _edge_type, dst in structural_edges}
+    for index, (src, dst) in enumerate(zip(structural_ids, structural_ids[1:])):
+        if (src, dst) not in structural_pairs:
+            _err(
+                errors,
+                f"root.chain[{index}:{index + 2}]",
+                "missing_path_edge",
+                f"chain nodes {src} and {dst} are not connected by a structural MES edge",
+            )
+
+    chain_node_types = [str(node_map.get(node_id, {}).get("type", "")) for node_id in structural_ids]
+
+    def _ordered_core_indices(types: Sequence[str]) -> Optional[Tuple[int, int, int]]:
+        """Locate Entry -> Behavior -> Impact in order within a selected chain.
+
+        A valid complete MES may include an intermediate VulnType node, e.g.
+        Entry -characterized_by-> VulnType -enables-> Behavior -causes-> Impact.
+        Requiring a direct Entry -enables-> Behavior edge would incorrectly
+        reject that legitimate source-graph path.
+        """
+        try:
+            entry_index = types.index("Entry")
+            behavior_index = types.index("Behavior", entry_index + 1)
+            impact_index = types.index("Impact", behavior_index + 1)
+        except ValueError:
+            return None
+        return entry_index, behavior_index, impact_index
+
+    core_indices = _ordered_core_indices(chain_node_types)
     if complete:
-        types = {node_map.get(node_id, {}).get("type") for node_id in structural_ids}
-        missing = {"Entry", "Behavior", "Impact"} - types
-        if missing:
-            _err(errors, "root.structural_node_ids", "core_chain", f"complete MES is missing {sorted(missing)}")
-        structural_edges = {
-            (str(edge.get("src")), str(edge.get("type")), str(edge.get("dst")))
-            for edge in edges
-            if edge.get("type") in STRUCTURAL_EDGE_TYPES
-        }
-        entry_ids = [nid for nid in structural_ids if node_map.get(nid, {}).get("type") == "Entry"]
-        behavior_ids = [nid for nid in structural_ids if node_map.get(nid, {}).get("type") == "Behavior"]
-        impact_ids = [nid for nid in structural_ids if node_map.get(nid, {}).get("type") == "Impact"]
-        if not any((entry, "enables", behavior) in structural_edges for entry in entry_ids for behavior in behavior_ids):
-            _err(errors, "root.edges", "core_edge", "complete MES requires an Entry -enables-> Behavior edge")
-        if not any((behavior, "causes", impact) in structural_edges for behavior in behavior_ids for impact in impact_ids):
-            _err(errors, "root.edges", "core_edge", "complete MES requires a Behavior -causes-> Impact edge")
+        if core_indices is None:
+            _err(
+                errors,
+                "root.structural_node_ids",
+                "core_chain",
+                "complete MES requires Entry -> ... -> Behavior -> ... -> Impact in chain order",
+            )
+        else:
+            entry_index, behavior_index, impact_index = core_indices
+            # Because every adjacent chain pair is checked above, these slices
+            # establish directed reachability without inventing shortcut edges.
+            if behavior_index <= entry_index or impact_index <= behavior_index:
+                _err(
+                    errors,
+                    "root.structural_node_ids",
+                    "core_chain",
+                    "complete MES core roles are not in Entry -> Behavior -> Impact order",
+                )
+    elif status not in ("empty", None) and core_indices is not None:
+        # A connected selected path containing all three ordered core roles is,
+        # by definition, complete and must not be labelled partial.
+        path_is_connected = all(
+            (src, dst) in structural_pairs
+            for src, dst in zip(structural_ids, structural_ids[1:])
+        )
+        if path_is_connected:
+            _err(
+                errors,
+                "root.status",
+                "status_mismatch",
+                "a connected Entry -> ... -> Behavior -> ... -> Impact chain must be status=complete",
+            )
 
     if not _is_mapping(record.get("selection_trace")):
         _err(errors, "root.selection_trace", "type", "must be an object")
