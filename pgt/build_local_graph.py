@@ -41,7 +41,7 @@ import re
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
-GRAPH_VERSION = "local-attack-graph-v2.0.0"
+GRAPH_VERSION = "local-attack-graph-v2.0.1"
 
 # Candidate structural relations.  Every pair in an available adjacent layer
 # is retained; the MES stage performs the actual evidence-constrained pruning.
@@ -480,9 +480,15 @@ def build_local_graph_for_one(
 
     for index, item in enumerate(_as_list(extraction.get("vuln_type")), start=1):
         if isinstance(item, Mapping):
+            # ``type`` is reserved for the graph node category. Preserve the
+            # extracted vulnerability label under ``vuln_type`` so it cannot
+            # overwrite ``type=VulnType`` in the output node.
+            vuln_item = dict(item)
+            if "type" in vuln_item:
+                vuln_item["vuln_type"] = vuln_item.get("type")
             add_structural_node(
-                "VulnType", index, item, f"VULNTYPE::VT{index}",
-                ("type", "subtype", "confidence"),
+                "VulnType", index, vuln_item, f"VULNTYPE::VT{index}",
+                ("vuln_type", "subtype", "confidence"),
             )
 
     for index, item in enumerate(_as_list(extraction.get("behaviors")), start=1):
