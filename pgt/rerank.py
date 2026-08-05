@@ -45,8 +45,8 @@ from tqdm import tqdm
 from .io import read_jsonl
 from .openai_client import get_openai_client, get_openai_runtime_config
 
-SCRIPT_VERSION = "rerank-v2.1.0"
-PROMPT_VERSION = "rerank-prompt-v2.1.0"
+SCRIPT_VERSION = "rerank-v2.2.0"
+PROMPT_VERSION = "rerank-prompt-v2.2.0"
 DEFAULT_MODEL = "gpt-4o-mini-2024-07-18"
 VALID_MODES = ("generic", "evidence", "structure", "full")
 STRUCTURAL_NODE_TYPES = {"Precondition", "Entry", "VulnType", "Behavior", "Impact"}
@@ -379,41 +379,56 @@ def _validate_mes_for_mode(
 # ---------------------------------------------------------------------------
 
 
-def _rerank_schema() -> Dict[str, Any]:
+def _score_item_schema() -> Dict[str, Any]:
     return {
-        "name": "cve_attck_rerank_result",
+        "type": "object",
+        "properties": {
+            "llm_score": {
+                "type": "number",
+                "minimum": 0.0,
+                "maximum": 1.0,
+            },
+            "reason": {"type": "string"},
+            "evidence_ids": {
+                "type": "array",
+                "items": {"type": "string"},
+            },
+        },
+        "required": ["llm_score", "reason", "evidence_ids"],
+        "additionalProperties": False,
+    }
+
+
+def _rerank_schema(candidate_ids: Sequence[str]) -> Dict[str, Any]:
+    """Build a candidate-specific strict response contract.
+
+    An array schema can constrain item shape but cannot reliably force the
+    model to emit every distinct candidate exactly once.  The keyed object
+    below makes every supplied technique ID a required property and rejects
+    additions, so omission and duplication are prevented at the structured
+    output boundary rather than repaired after generation.
+    """
+
+    ordered_ids = [str(tid) for tid in candidate_ids]
+    if not ordered_ids or len(set(ordered_ids)) != len(ordered_ids):
+        raise ValueError("Response schema requires a non-empty unique candidate list.")
+
+    score_properties = {tid: _score_item_schema() for tid in ordered_ids}
+    schema_hash = _sha256_text(_canonical_json(ordered_ids))[:12]
+    return {
+        "name": f"cve_attck_rerank_{schema_hash}",
         "strict": True,
         "schema": {
             "type": "object",
             "properties": {
-                "ranking": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "technique_id": {"type": "string"},
-                            "llm_score": {
-                                "type": "number",
-                                "minimum": 0.0,
-                                "maximum": 1.0,
-                            },
-                            "reason": {"type": "string"},
-                            "evidence_ids": {
-                                "type": "array",
-                                "items": {"type": "string"},
-                            },
-                        },
-                        "required": [
-                            "technique_id",
-                            "llm_score",
-                            "reason",
-                            "evidence_ids",
-                        ],
-                        "additionalProperties": False,
-                    },
+                "scores": {
+                    "type": "object",
+                    "properties": score_properties,
+                    "required": ordered_ids,
+                    "additionalProperties": False,
                 }
             },
-            "required": ["ranking"],
+            "required": ["scores"],
             "additionalProperties": False,
         },
     }
@@ -464,7 +479,8 @@ def _build_messages(
     system_lines = [
         "You are performing controlled candidate discrimination for CVE-to-MITRE ATT&CK mapping.",
         "Evaluate only the candidate techniques supplied in the user message.",
-        "Return every supplied technique_id exactly once; do not add or omit candidates.",
+        "Return one result for every supplied technique_id; do not add or omit candidates.",
+        "The top-level scores object must use each supplied technique_id as an exact property key.",
         "The llm_score is a support score, not a calibrated probability.",
         "Use this rubric consistently:",
         "- 0.85-1.00: the supplied context directly states or clearly instantiates the candidate mechanism.",
@@ -526,7 +542,7 @@ def _build_messages(
         [
             "Candidate techniques (the order is the common retrieval order used in every condition):",
             candidate_json,
-            "Return the complete reranking now.",
+            "Return the complete scores object now.",
         ]
     )
 
@@ -563,7 +579,7 @@ def _context_evidence_ids(
 
 
 def _parse_complete_ranking(
-    ranking: Any,
+    response_items: Any,
     *,
     candidate_ids: Sequence[str],
     valid_evidence_ids: set[str],
@@ -575,9 +591,6 @@ def _parse_complete_ranking(
     strong_score_threshold: float,
     max_reason_chars: int,
 ) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, int]]:
-    if not isinstance(ranking, list):
-        raise ValueError("LLM response field 'ranking' is not an array.")
-
     expected = list(candidate_ids)
     expected_set = set(expected)
     parsed: Dict[str, Dict[str, Any]] = {}
@@ -587,14 +600,39 @@ def _parse_complete_ranking(
         "citation_caps": 0,
         "mes_overlap_caps": 0,
         "reason_truncations": 0,
+        "keyed_response_records": 0,
+        "legacy_array_response_records": 0,
     }
 
-    for item in ranking:
-        if not isinstance(item, Mapping):
-            raise ValueError("LLM ranking contains a non-object item.")
-        tid = item.get("technique_id")
-        if not isinstance(tid, str) or tid not in expected_set:
-            raise ValueError(f"LLM returned unknown technique_id: {tid!r}")
+    normalized_items: List[Tuple[str, Mapping[str, Any]]] = []
+    if isinstance(response_items, Mapping):
+        stats["keyed_response_records"] = 1
+        unknown = sorted(str(key) for key in response_items if str(key) not in expected_set)
+        if unknown:
+            raise ValueError(f"LLM returned unknown technique_id(s): {', '.join(unknown)}")
+        missing = [tid for tid in expected if tid not in response_items]
+        if missing:
+            raise ValueError(f"LLM omitted candidate(s): {', '.join(missing)}")
+        for tid in expected:
+            item = response_items.get(tid)
+            if not isinstance(item, Mapping):
+                raise ValueError(f"LLM result for {tid} is not an object.")
+            normalized_items.append((tid, item))
+    elif isinstance(response_items, list):
+        # Backward-compatible parser for old saved/mock responses. New API
+        # requests use the keyed strict schema above.
+        stats["legacy_array_response_records"] = 1
+        for item in response_items:
+            if not isinstance(item, Mapping):
+                raise ValueError("LLM ranking contains a non-object item.")
+            tid = item.get("technique_id")
+            if not isinstance(tid, str) or tid not in expected_set:
+                raise ValueError(f"LLM returned unknown technique_id: {tid!r}")
+            normalized_items.append((tid, item))
+    else:
+        raise ValueError("LLM response must contain a keyed 'scores' object.")
+
+    for tid, item in normalized_items:
         if tid in parsed:
             raise ValueError(f"LLM returned duplicate technique_id: {tid}")
 
@@ -780,6 +818,8 @@ def _configuration(args: argparse.Namespace, model: str, topk: int) -> Dict[str,
         "beta": args.beta,
         "final_score_formula": "beta*score_fused + (1-beta)*llm_score",
         "strict_json_schema": True,
+        "response_contract": "candidate_keyed_required_object-v1",
+        "retry_seed_policy": "base_seed_plus_attempt_index",
         "strict_retrieval_scores": args.strict_scores,
         "allow_empty_mes": args.allow_empty_mes,
         "require_complete_mes": args.require_complete_mes,
@@ -791,7 +831,7 @@ def _configuration(args: argparse.Namespace, model: str, topk: int) -> Dict[str,
         "max_technique_chars": args.max_technique_chars,
         "technique_specific_calibration": False,
         "api_failure_policy": "fail_after_exhausted_attempts",
-        "incomplete_response_policy": "retry_then_fail",
+        "incomplete_response_policy": "schema_prevent_then_retry_with_distinct_seed",
     }
 
 
@@ -826,10 +866,34 @@ def _prepare_output(
         )
 
     if resume:
-        if not output_path.exists() or not manifest_path.exists():
+        output_exists = output_path.exists()
+        manifest_exists = manifest_path.exists()
+
+        # ``--resume`` is also used by the end-to-end orchestrator when a
+        # stage has not started yet. In that case neither artifact exists, so
+        # begin a fresh run rather than treating the absence as corruption.
+        if not output_exists and not manifest_exists:
+            return set()
+
+        # A manifest can legitimately exist before the first result row is
+        # appended (for example, interruption during the first API call).
+        # Validate its signature and safely restart from zero completed rows.
+        if manifest_exists and not output_exists:
+            existing_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if existing_manifest.get("run_signature") != run_signature:
+                # No result row exists, so there is nothing to mix with the
+                # new run. Remove the stale pre-first-row manifest and start
+                # cleanly under the current response contract.
+                manifest_path.unlink()
+            return set()
+
+        # An output without its manifest cannot be verified against the
+        # current configuration and inputs, so fail rather than mixing runs.
+        if output_exists and not manifest_exists:
             raise FileNotFoundError(
-                "Resume requires both the output JSONL and its manifest."
+                "Cannot resume: output JSONL exists but its manifest is missing."
             )
+
         existing_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         if existing_manifest.get("run_signature") != run_signature:
             raise RuntimeError(
@@ -949,6 +1013,8 @@ def main() -> None:
         "citation_caps": 0,
         "mes_overlap_caps": 0,
         "reason_truncations": 0,
+        "keyed_response_records": 0,
+        "legacy_array_response_records": 0,
         "retrieval_score_clamps": 0,
     }
 
@@ -970,7 +1036,6 @@ def main() -> None:
     _write_json(manifest_path, manifest)
 
     client = get_openai_client()
-    schema = _rerank_schema()
 
     for candidate_row in tqdm(candidate_rows, desc=f"rerank[{args.mode}]"):
         input_id = candidate_row.get("input_id")
@@ -1015,6 +1080,8 @@ def main() -> None:
         )
         candidate_ids = [str(candidate["technique_id"]) for candidate in candidates]
         candidate_set_sha256 = _sha256_text(_canonical_json(candidate_ids))
+        schema = _rerank_schema(candidate_ids)
+        response_schema_sha256 = _sha256_text(_canonical_json(schema))
 
         messages, prompt_hash = _build_messages(
             input_id=input_id,
@@ -1037,9 +1104,12 @@ def main() -> None:
         response_meta: Dict[str, Any] = {}
         last_error: Optional[Exception] = None
         attempts_used = 0
+        attempt_seeds: List[int] = []
 
         for attempt_index in range(args.attempts):
             attempts_used += 1
+            attempt_seed = int(args.seed) + attempt_index
+            attempt_seeds.append(attempt_seed)
             counters["api_attempts"] += 1
             if attempt_index > 0:
                 counters["api_retries"] += 1
@@ -1050,11 +1120,14 @@ def main() -> None:
                     messages=messages,
                     schema=schema,
                     temperature=args.temperature,
-                    seed=args.seed,
+                    seed=attempt_seed,
                     max_tokens=args.max_tokens,
                 )
+                response_items = parsed_response.get("scores")
+                if response_items is None and "ranking" in parsed_response:
+                    response_items = parsed_response.get("ranking")
                 llm_map, parse_stats = _parse_complete_ranking(
-                    parsed_response.get("ranking"),
+                    response_items,
                     candidate_ids=candidate_ids,
                     valid_evidence_ids=valid_eids,
                     mes_evidence_ids=mes_eids,
@@ -1113,7 +1186,10 @@ def main() -> None:
                 "topk": topk,
                 "beta": args.beta,
                 "attempts_used": attempts_used,
+                "attempt_seeds": attempt_seeds,
                 "candidate_set_sha256": candidate_set_sha256,
+                "response_contract": "candidate_keyed_required_object-v1",
+                "response_schema_sha256": response_schema_sha256,
                 "prompt_sha256": prompt_hash,
                 "mes_status": mes_row.get("status") if mes_row else None,
                 "complete_core_chain": (
