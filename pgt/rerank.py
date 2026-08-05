@@ -45,7 +45,7 @@ from tqdm import tqdm
 from .io import read_jsonl
 from .openai_client import get_openai_client, get_openai_runtime_config
 
-SCRIPT_VERSION = "rerank-v2.2.0"
+SCRIPT_VERSION = "rerank-v2.2.1"
 PROMPT_VERSION = "rerank-prompt-v2.2.0"
 DEFAULT_MODEL = "gpt-4o-mini-2024-07-18"
 VALID_MODES = ("generic", "evidence", "structure", "full")
@@ -723,6 +723,36 @@ def _response_metadata(response: Any) -> Dict[str, Any]:
     }
 
 
+def _adaptive_completion_tokens(
+    *,
+    requested_max_tokens: int,
+    candidate_count: int,
+    attempt_index: int,
+    hard_cap: int = 6000,
+) -> int:
+    """Return a deterministic output budget for keyed candidate scoring.
+
+    A keyed response contains one JSON object per candidate.  The original
+    1,800-token ceiling is adequate for Top-20, but can truncate valid Top-30
+    or Top-50 structured outputs before the closing braces.  This policy keeps
+    the user-requested value as the floor, scales only with candidate count,
+    and increases deterministically on validation retries.
+    """
+
+    if requested_max_tokens < 1 or candidate_count < 1 or attempt_index < 0:
+        raise ValueError("Invalid adaptive completion-token inputs.")
+
+    # Roughly covers the repeated JSON keys, score, concise reason, and
+    # evidence IDs for each candidate, plus the top-level object overhead.
+    initial = max(int(requested_max_tokens), 1000 + 70 * int(candidate_count))
+    initial = min(initial, int(hard_cap))
+    if attempt_index == 0:
+        return initial
+
+    escalated = int(round(initial * (1.25 ** attempt_index)))
+    return min(max(initial, escalated), int(hard_cap))
+
+
 def _call_reranker(
     *,
     client: Any,
@@ -1005,6 +1035,8 @@ def main() -> None:
         "api_retries": 0,
         "api_failures": 0,
         "response_validation_failures": 0,
+        "adaptive_token_budget_records": 0,
+        "max_effective_completion_tokens": 0,
         "partial_mes": 0,
         "complete_mes": 0,
         "empty_mes": 0,
@@ -1031,6 +1063,11 @@ def main() -> None:
         "configuration": configuration,
         "input_sha256": input_hashes,
         "resume_existing_rows": len(done_ids),
+        "execution_policy": {
+            "completion_token_budget": "max(requested, 1000 + 70*candidates), then x1.25 per retry",
+            "completion_token_hard_cap": 6000,
+            "prompt_or_response_contract_changed": False,
+        },
         "counters": counters,
     }
     _write_json(manifest_path, manifest)
@@ -1105,11 +1142,22 @@ def main() -> None:
         last_error: Optional[Exception] = None
         attempts_used = 0
         attempt_seeds: List[int] = []
+        attempt_max_tokens: List[int] = []
 
         for attempt_index in range(args.attempts):
             attempts_used += 1
             attempt_seed = int(args.seed) + attempt_index
             attempt_seeds.append(attempt_seed)
+            effective_max_tokens = _adaptive_completion_tokens(
+                requested_max_tokens=args.max_tokens,
+                candidate_count=len(candidate_ids),
+                attempt_index=attempt_index,
+            )
+            attempt_max_tokens.append(effective_max_tokens)
+            counters["max_effective_completion_tokens"] = max(
+                int(counters["max_effective_completion_tokens"]),
+                int(effective_max_tokens),
+            )
             counters["api_attempts"] += 1
             if attempt_index > 0:
                 counters["api_retries"] += 1
@@ -1121,7 +1169,7 @@ def main() -> None:
                     schema=schema,
                     temperature=args.temperature,
                     seed=attempt_seed,
-                    max_tokens=args.max_tokens,
+                    max_tokens=effective_max_tokens,
                 )
                 response_items = parsed_response.get("scores")
                 if response_items is None and "ranking" in parsed_response:
@@ -1161,6 +1209,9 @@ def main() -> None:
                 f"{input_id}: reranking failed after {args.attempts} attempts: {last_error}"
             ) from last_error
 
+        if attempt_max_tokens and max(attempt_max_tokens) > int(args.max_tokens):
+            counters["adaptive_token_budget_records"] += 1
+
         for key, value in parse_stats.items():
             counters[key] += int(value)
 
@@ -1183,6 +1234,9 @@ def main() -> None:
                 "temperature": args.temperature,
                 "seed": args.seed,
                 "max_completion_tokens": args.max_tokens,
+                "attempt_max_completion_tokens": attempt_max_tokens,
+                "effective_max_completion_tokens": max(attempt_max_tokens),
+                "completion_token_budget_policy": "adaptive-by-candidate-count-v1",
                 "topk": topk,
                 "beta": args.beta,
                 "attempts_used": attempts_used,
