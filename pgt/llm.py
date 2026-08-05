@@ -1,17 +1,28 @@
 # pgt/llm.py
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 RE_ALL = re.compile
 
 # ---- debug: log only once for the first real OpenAI API call ----
 _OPENAI_FIRST_CALL_LOGGED = False
+
+EXTRACTION_PIPELINE_VERSION = "llm-extraction-v2.0.0"
+PROMPT_VERSION = "cve-extraction-prompt-v2.0.0"
+DEFAULT_MODEL = "gpt-4o-mini-2024-07-18"
+DEFAULT_TEMPERATURE = 0.0
+DEFAULT_SEED = 20260805
+DEFAULT_MAX_COMPLETION_TOKENS = 1400
+DEFAULT_MAX_ATTEMPTS = 2
+DEFAULT_RETRY_BASE_SECONDS = 0.6
+
 
 
 def _log_openai_first_call(msg: str) -> None:
@@ -23,7 +34,7 @@ def _log_openai_first_call(msg: str) -> None:
 
 
 # ---------------------------
-# Local secret loader (NO env var required)
+# Optional local configuration loader
 # ---------------------------
 
 def _load_secrets() -> Dict[str, str]:
@@ -47,11 +58,34 @@ _SECRETS = _load_secrets()
 
 
 def _get_cfg(name: str, default: Optional[str] = None) -> Optional[str]:
-    # priority: secrets.json -> env -> default
+    # Environment variables are explicit run-time configuration and therefore
+    # take precedence over the optional local secrets file.
+    v = os.getenv(name)
+    if v:
+        return v
     if name in _SECRETS and _SECRETS[name]:
         return _SECRETS[name]
-    v = os.getenv(name)
-    return v if v else default
+    return default
+
+
+def _get_int_cfg(name: str, default: int) -> int:
+    raw = _get_cfg(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return default
+
+
+def _get_float_cfg(name: str, default: float) -> float:
+    raw = _get_cfg(name)
+    if raw is None:
+        return default
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return default
 
 
 # ---------------------------
@@ -151,6 +185,35 @@ def _rule_based_extract(input_id: str, sentences: Dict[str, str]) -> Dict[str, A
             "confidence": 0.35,
         })
 
+    def add_relation(src: str, relation_type: str, dst: str, left: Dict[str, Any], right: Dict[str, Any]) -> None:
+        left_eids = [x for x in left.get("evidence_ids", []) if isinstance(x, str)]
+        right_eids = [x for x in right.get("evidence_ids", []) if isinstance(x, str)]
+        shared = [x for x in left_eids if x in set(right_eids)]
+        evidence_ids = shared or list(dict.fromkeys(left_eids + right_eids))
+        if not evidence_ids:
+            return
+        confidence = min(float(left.get("confidence", 0.5)), float(right.get("confidence", 0.5)))
+        relations.append({
+            "src": src,
+            "type": relation_type,
+            "dst": dst,
+            "evidence_ids": evidence_ids,
+            "confidence": max(0.0, min(1.0, confidence)),
+        })
+
+    if preconditions and entry:
+        add_relation("P1", "enables", "EN1", preconditions[0], entry[0])
+    if preconditions and behaviors:
+        add_relation("P1", "enables", "B1", preconditions[0], behaviors[0])
+    if entry and vuln_type:
+        add_relation("EN1", "characterized_by", "VT1", entry[0], vuln_type[0])
+    if entry and behaviors:
+        add_relation("EN1", "enables", "B1", entry[0], behaviors[0])
+    if vuln_type and behaviors:
+        add_relation("VT1", "enables", "B1", vuln_type[0], behaviors[0])
+    if behaviors and impacts:
+        add_relation("B1", "causes", "I1", behaviors[0], impacts[0])
+
     return {
         "input_id": input_id,
         "preconditions": preconditions,
@@ -233,7 +296,22 @@ def _extraction_schema() -> Dict[str, Any]:
                     "type": "array",
                     "items": {
                         "type": "object",
-                        "properties": {},
+                        "properties": {
+                            "src": {"type": "string"},
+                            "type": {
+                                "type": "string",
+                                "enum": [
+                                    "enables",
+                                    "characterized_by",
+                                    "causes",
+                                    "leads_to",
+                                ],
+                            },
+                            "dst": {"type": "string"},
+                            "evidence_ids": {"type": "array", "items": {"type": "string"}},
+                            "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                        },
+                        "required": ["src", "type", "dst", "evidence_ids", "confidence"],
                         "additionalProperties": False,
                     },
                 },
@@ -451,7 +529,117 @@ def _detect_impact_types(text: Any) -> set[str]:
     return out
 
 
-from typing import Any, Dict, List, Tuple
+_NODE_REF_RE = re.compile(r"^(P|EN|VT|B|I)(\d+)$", re.IGNORECASE)
+_RELATION_PREFIX_BY_FIELD = {
+    "preconditions": "P",
+    "entry": "EN",
+    "vuln_type": "VT",
+    "behaviors": "B",
+    "impacts": "I",
+}
+_CANONICAL_RELATION_BY_PAIR = {
+    ("P", "EN"): "enables",
+    ("P", "B"): "enables",
+    ("EN", "VT"): "characterized_by",
+    ("EN", "B"): "enables",
+    ("VT", "B"): "enables",
+    ("B", "I"): "causes",
+}
+
+
+def _normalise_node_ref(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip().upper()
+    if not text:
+        return None
+    if "::" in text:
+        text = text.rsplit("::", 1)[-1]
+    text = re.sub(r"[\s_:-]+", "", text)
+    replacements = (
+        ("PRECONDITION", "P"),
+        ("VULNTYPE", "VT"),
+        ("BEHAVIOR", "B"),
+        ("BEHAVIOUR", "B"),
+        ("IMPACT", "I"),
+        ("ENTRY", "EN"),
+    )
+    for long_name, prefix in replacements:
+        if text.startswith(long_name):
+            text = prefix + text[len(long_name):]
+            break
+    match = _NODE_REF_RE.fullmatch(text)
+    if not match:
+        return None
+    return f"{match.group(1).upper()}{int(match.group(2))}"
+
+
+def _node_ref_prefix(ref: str) -> str:
+    match = _NODE_REF_RE.fullmatch(ref)
+    return match.group(1).upper() if match else ""
+
+
+def _sanitize_relations(
+    raw_relations: Any,
+    alias_map: Dict[str, str],
+    valid_ids: set[str],
+) -> List[Dict[str, Any]]:
+    if not isinstance(raw_relations, list):
+        return []
+
+    out: List[Dict[str, Any]] = []
+    seen = set()
+    for relation in raw_relations:
+        if not isinstance(relation, dict):
+            continue
+        raw_src = _normalise_node_ref(relation.get("src", relation.get("source")))
+        raw_dst = _normalise_node_ref(relation.get("dst", relation.get("target")))
+        if raw_src is None or raw_dst is None:
+            continue
+        src = alias_map.get(raw_src)
+        dst = alias_map.get(raw_dst)
+        if src is None or dst is None or src == dst:
+            continue
+
+        pair = (_node_ref_prefix(src), _node_ref_prefix(dst))
+        canonical_type = _CANONICAL_RELATION_BY_PAIR.get(pair)
+        if canonical_type is None:
+            continue
+
+        supplied_type = _to_snake(relation.get("type", relation.get("rel", "")))
+        if supplied_type not in {"enables", "characterized_by", "causes", "leads_to"}:
+            continue
+
+        eids: List[str] = []
+        seen_eids = set()
+        for eid in relation.get("evidence_ids") or []:
+            if isinstance(eid, str) and eid in valid_ids and eid not in seen_eids:
+                seen_eids.add(eid)
+                eids.append(eid)
+        if not eids:
+            continue
+
+        try:
+            confidence = float(relation.get("confidence", 0.8))
+        except (TypeError, ValueError):
+            confidence = 0.8
+        if confidence != confidence:
+            confidence = 0.8
+        confidence = max(0.0, min(1.0, confidence))
+
+        key = (src, canonical_type, dst)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({
+            "src": src,
+            "type": canonical_type,
+            "dst": dst,
+            "evidence_ids": eids,
+            "confidence": confidence,
+        })
+    return out
+
 
 def _sanitize_evidence_ids(extraction: Dict[str, Any], valid_ids: set[str]) -> Dict[str, Any]:
     """
@@ -537,19 +725,33 @@ def _sanitize_evidence_ids(extraction: Dict[str, Any], valid_ids: set[str]) -> D
 
         return out
 
-    # --- apply filtering ---
-    extraction["preconditions"] = _filter(extraction.get("preconditions", []), "preconditions")
-    extraction["entry"] = _filter(extraction.get("entry", []), "entry")
-    extraction["vuln_type"] = _filter(extraction.get("vuln_type", []), "vuln_type")
-    extraction["behaviors"] = _filter(extraction.get("behaviors", []), "behaviors")
-    extraction["impacts"] = _filter(extraction.get("impacts", []), "impacts")
+    # Preserve original object positions so relation aliases remain valid even
+    # when an unsupported item is removed during evidence sanitisation.
+    original_collections = {
+        field: list(extraction.get(field) or [])
+        for field in _RELATION_PREFIX_BY_FIELD
+    }
+    raw_relations = extraction.get("relations")
 
-    # relations: ensure list
-    rel = extraction.get("relations")
-    if not isinstance(rel, list):
-        extraction["relations"] = []
-    else:
-        extraction["relations"] = rel
+    # --- apply filtering ---
+    extraction["preconditions"] = _filter(original_collections["preconditions"], "preconditions")
+    extraction["entry"] = _filter(original_collections["entry"], "entry")
+    extraction["vuln_type"] = _filter(original_collections["vuln_type"], "vuln_type")
+    extraction["behaviors"] = _filter(original_collections["behaviors"], "behaviors")
+    extraction["impacts"] = _filter(original_collections["impacts"], "impacts")
+
+    alias_map: Dict[str, str] = {}
+    for field, prefix in _RELATION_PREFIX_BY_FIELD.items():
+        original_items = original_collections[field]
+        kept_items = extraction[field]
+        new_index_by_identity = {id(item): index for index, item in enumerate(kept_items, start=1)}
+        for old_index, item in enumerate(original_items, start=1):
+            new_index = new_index_by_identity.get(id(item))
+            if new_index is not None:
+                alias_map[f"{prefix}{old_index}"] = f"{prefix}{new_index}"
+                alias_map[f"{prefix}{new_index}"] = f"{prefix}{new_index}"
+
+    extraction["relations"] = _sanitize_relations(raw_relations, alias_map, valid_ids)
 
     # ---- post-fix: impacts enrichment (without forcing "unspecified") ----
     try:
@@ -646,36 +848,48 @@ def _sanitize_evidence_ids(extraction: Dict[str, Any], valid_ids: set[str]) -> D
 def _build_messages(input_id: str, sentences: Dict[str, str]) -> List[Dict[str, str]]:
     evidence_lines = "\n".join([f"{eid}: {text}" for eid, text in sentences.items()])
     system = (
-        "You are a security information extraction engine.\n"
-        "Extract structured fields from CVE evidence sentences into the required JSON schema.\n"
+        "You are a deterministic cybersecurity information extraction engine.\n"
+        "Extract only facts explicitly supported by the supplied CVE evidence units.\n"
+        "The output must follow the provided strict JSON schema.\n"
         "\n"
-        "Rules:\n"
-        "1) Only use evidence_ids that appear in the evidence list (E1, E2, ...).\n"
-        "2) Do NOT invent facts. Only extract what is explicitly supported by evidence sentences.\n"
-        "3) Evidence alignment MUST be precise:\n"
-        "   - For each extracted item, cite the 1-2 most directly supporting evidence sentences.\n"
-        "   - Do NOT default to E1 when multiple evidence sentences exist.\n"
-        "   - Do NOT cite an evidence sentence unless it explicitly contains the fact.\n"
-        "4) entry.vector must describe an attack surface / interface / component (e.g., XML-RPC endpoint, HTTP update channel, TLS handshake, DCCP packet).\n"
-        "   - Do NOT use product name or version range as entry.vector.\n"
-        "   - Put product/version information in entry.detail instead.\n"
-        "5) impacts and vuln_type:\n"
-        "   - Avoid using the literal string 'unspecified'.\n"
-        "   - If you cannot infer a clean category from evidence, output an empty list for that section.\n"
-        "6) behaviors should be atomic and readable:\n"
-        "   - action: concise verb phrase (e.g., download, spoof, execute, bypass, decrypt)\n"
-        "   - target: the object acted on (or null if truly unknown)\n"
-        "   - impact: a short outcome phrase if supported (or null if unknown)\n"
-        "7) confidence must be in [0,1].\n"
-    )
+        "Evidence rules:\n"
+        "1) Use only evidence identifiers present in the input.\n"
+        "2) Cite the smallest set of directly supporting evidence units for every item.\n"
+        "3) Do not infer attacker capabilities, mechanisms, targets, or impacts that are not stated.\n"
+        "4) If a field is unsupported, return an empty array or JSON null as allowed.\n"
+        "\n"
+        "Element rules:\n"
+        "5) entry.vector is an attack surface, interface, protocol, file, endpoint, or component; "
+        "put product/version context in entry.detail.\n"
+        "6) behaviors must be atomic: action is a concise verb phrase, target is the acted-on object "
+        "or null, and impact is a short supported outcome or null.\n"
+        "7) Do not use the literal category 'unspecified'; use an empty list instead.\n"
+        "8) Preserve narrative order within each array.\n"
+        "\n"
+        "Relation rules:\n"
+        "9) Refer to extracted items by their output position: P1/P2 for preconditions, "
+        "EN1/EN2 for entries, VT1/VT2 for vulnerability types, B1/B2 for behaviors, "
+        "and I1/I2 for impacts.\n"
+        "10) Emit a relation only when the evidence directly supports the link. Allowed layer links are "
+        "P->EN, P->B, EN->VT, EN->B, VT->B, and B->I.\n"
+        "11) Use relation type 'enables' for P->EN, P->B, EN->B, and VT->B; "
+        "'characterized_by' for EN->VT; and 'causes' for B->I.\n"
+        "12) Relation evidence_ids must support the connection, not merely one endpoint.\n"
+        "13) Confidence values must be between 0 and 1.\n"
+    ).replace("\n\n", "\n")
 
     user = (
         f"input_id: {input_id}\n"
-        "Evidence sentences:\n"
+        "Evidence units:\n"
         f"{evidence_lines}\n\n"
-        "Return JSON matching the required schema.\n"
+        "Return the structured extraction and explicit supported relations.\n"
     )
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
+
+
+def _prompt_sha256(messages: List[Dict[str, str]]) -> str:
+    payload = json.dumps(messages, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 # ---------------------------
@@ -683,30 +897,54 @@ def _build_messages(input_id: str, sentences: Dict[str, str]) -> List[Dict[str, 
 # ---------------------------
 
 def call_llm_extract(input_id: str, sentences: Dict[str, str]) -> Dict[str, Any]:
-    model = _get_cfg("OPENAI_MODEL", "gpt-4o-mini")
+    model = _get_cfg("OPENAI_EXTRACTION_MODEL") or _get_cfg("OPENAI_MODEL", DEFAULT_MODEL)
+    temperature = _get_float_cfg("OPENAI_EXTRACTION_TEMPERATURE", DEFAULT_TEMPERATURE)
+    seed = _get_int_cfg("OPENAI_EXTRACTION_SEED", DEFAULT_SEED)
+    max_tokens = _get_int_cfg("OPENAI_EXTRACTION_MAX_TOKENS", DEFAULT_MAX_COMPLETION_TOKENS)
+    max_attempts = max(1, _get_int_cfg("OPENAI_EXTRACTION_MAX_ATTEMPTS", DEFAULT_MAX_ATTEMPTS))
+    retry_base = max(0.0, _get_float_cfg("OPENAI_EXTRACTION_RETRY_BASE_SECONDS", DEFAULT_RETRY_BASE_SECONDS))
     valid_ids = set(sentences.keys())
+
+    messages = _build_messages(input_id, sentences)
+    prompt_hash = _prompt_sha256(messages)
+    base_provenance: Dict[str, Any] = {
+        "pipeline_version": EXTRACTION_PIPELINE_VERSION,
+        "prompt_version": PROMPT_VERSION,
+        "requested_model": model,
+        "temperature": temperature,
+        "seed": seed,
+        "max_completion_tokens": max_tokens,
+        "response_format": "strict_json_schema",
+        "max_attempts": max_attempts,
+        "retry_base_seconds": retry_base,
+        "prompt_sha256": prompt_hash,
+    }
 
     try:
         from .openai_client import get_openai_client
         client = get_openai_client()
     except Exception as e:
-        fb = _rule_based_extract(input_id, sentences)
+        fb = _sanitize_evidence_ids(_rule_based_extract(input_id, sentences), valid_ids)
         fb["_used_llm"] = False
         fb["_validation_errors"] = [f"llm_client_init_failed: {type(e).__name__}: {e}"]
+        fb["_provenance"] = {
+            **base_provenance,
+            "mode": "rule_based_fallback",
+            "fallback_reason": "client_initialisation_failed",
+        }
         return fb
 
-    messages = _build_messages(input_id, sentences)
     schema = _extraction_schema()
-
     last_err: Optional[Exception] = None
-    for attempt in range(2):
+    for attempt in range(1, max_attempts + 1):
         try:
             resp = client.chat.completions.create(
                 model=model,
                 messages=messages,
-                temperature=0,
+                temperature=temperature,
+                seed=seed,
                 response_format={"type": "json_schema", "json_schema": schema},
-                max_completion_tokens=1200,
+                max_completion_tokens=max_tokens,
             )
             content = resp.choices[0].message.content or "{}"
             data = json.loads(content)
@@ -722,13 +960,30 @@ def call_llm_extract(input_id: str, sentences: Dict[str, str]) -> Dict[str, Any]
                 "_validation_errors": [],
                 "_used_llm": True,
             }
-            return _sanitize_evidence_ids(extraction, valid_ids)
+            extraction = _sanitize_evidence_ids(extraction, valid_ids)
+            extraction["_provenance"] = {
+                **base_provenance,
+                "mode": "llm",
+                "attempts_used": attempt,
+                "returned_model": getattr(resp, "model", None),
+                "system_fingerprint": getattr(resp, "system_fingerprint", None),
+                "response_id": getattr(resp, "id", None),
+            }
+            return extraction
 
         except Exception as e:
             last_err = e
-            time.sleep(0.6 * (attempt + 1))
+            if attempt < max_attempts:
+                time.sleep(retry_base * attempt)
 
-    fb = _rule_based_extract(input_id, sentences)
+    fb = _sanitize_evidence_ids(_rule_based_extract(input_id, sentences), valid_ids)
     fb["_used_llm"] = False
     fb["_validation_errors"] = [f"llm_failed: {type(last_err).__name__}: {last_err}"] if last_err else []
+    fb["_provenance"] = {
+        **base_provenance,
+        "mode": "rule_based_fallback",
+        "attempts_used": max_attempts,
+        "fallback_reason": "all_llm_attempts_failed",
+    }
     return fb
+
