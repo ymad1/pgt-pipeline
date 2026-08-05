@@ -29,7 +29,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence
 
-SCRIPT_VERSION = "reviewer2-pipeline-v1.1.0"
+_REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPOSITORY_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPOSITORY_ROOT))
+
+from pgt.io import read_jsonl as validated_read_jsonl
+from pgt.io import write_jsonl as validated_write_jsonl
+
+SCRIPT_VERSION = "reviewer2-pipeline-v1.2.0"
 DEFAULT_CONFIG_NAME = "pipeline_config.json"
 STAGE_ORDER = (
     "data",
@@ -205,6 +212,7 @@ def _path_metadata(paths: Iterable[Path]) -> Dict[str, Dict[str, Any]]:
 
 DEFAULT_CONFIG: Dict[str, Any] = {
     "workspace": "runs/reviewer2_v2",
+    "smoke_workspace": "runs/reviewer2_v2_smoke",
     "data": {
         "x_train": "data/cve2attck_src_20260107/X_train.csv",
         "y_train": "data/cve2attck_src_20260107/y_train.csv",
@@ -231,6 +239,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "seed": 20260805,
         "max_tokens": 1400,
         "attempts": 2,
+        "retry_base_seconds": 0.8,
         "allow_fallback": False,
         "allow_validation_errors": False,
         "mes_max_path_nodes": 4,
@@ -282,6 +291,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "tail_max_support": 5,
         "head_min_support": 21,
         "reference_method": "full",
+        "include_retrieval_baseline": True,
+        "retrieval_method_name": "retrieval",
     },
 }
 
@@ -357,6 +368,8 @@ class PipelineRunner:
             "workspace": str(paths.workspace),
             "configuration_sha256": _sha256_bytes(_stable_json_bytes(config)),
             "smoke_records_per_split": smoke_records_per_split,
+            "run_scope": "smoke" if smoke_records_per_split > 0 else "formal",
+            "eligible_for_formal_reporting": smoke_records_per_split == 0,
             "created_utc": _utc_now(),
             "updated_utc": _utc_now(),
             "stages": {},
@@ -366,6 +379,10 @@ class PipelineRunner:
             if previous.get("configuration_sha256") != self.state["configuration_sha256"]:
                 raise RuntimeError(
                     "Cannot resume: configuration hash differs from the existing pipeline state."
+                )
+            if int(previous.get("smoke_records_per_split", -1)) != smoke_records_per_split:
+                raise RuntimeError(
+                    "Cannot resume: smoke/full scope differs from the existing pipeline state."
                 )
             self.state = previous
 
@@ -394,11 +411,21 @@ class PipelineRunner:
 
         outputs_exist = bool(expected_outputs) and all(path.exists() for path in expected_outputs)
         previous_commands = stage_state.get("commands", [])
-        previous_success = any(
-            item.get("name") == name and item.get("status") == "succeeded"
-            for item in previous_commands
+        previous_record = next(
+            (
+                item
+                for item in reversed(previous_commands)
+                if item.get("name") == name and item.get("status") == "succeeded"
+            ),
+            None,
         )
-        if self.resume and outputs_exist and previous_success:
+        if self.resume and outputs_exist and previous_record is not None:
+            current_outputs = _path_metadata(expected_outputs)
+            if previous_record.get("outputs") != current_outputs:
+                raise RuntimeError(
+                    f"Cannot resume {stage}/{name}: existing output hashes differ "
+                    "from the recorded successful run."
+                )
             print(f"[resume] {stage}/{name}")
             return
 
@@ -460,11 +487,21 @@ class PipelineRunner:
     ) -> None:
         stage_state = self.state.setdefault("stages", {}).setdefault(stage, {"commands": []})
         outputs_exist = bool(expected_outputs) and all(path.exists() for path in expected_outputs)
-        previous_success = any(
-            item.get("name") == name and item.get("status") == "succeeded"
-            for item in stage_state.get("commands", [])
+        previous_record = next(
+            (
+                item
+                for item in reversed(stage_state.get("commands", []))
+                if item.get("name") == name and item.get("status") == "succeeded"
+            ),
+            None,
         )
-        if self.resume and outputs_exist and previous_success:
+        if self.resume and outputs_exist and previous_record is not None:
+            current_outputs = _path_metadata(expected_outputs)
+            if previous_record.get("outputs") != current_outputs:
+                raise RuntimeError(
+                    f"Cannot resume {stage}/{name}: existing output hashes differ "
+                    "from the recorded successful run."
+                )
             print(f"[resume] {stage}/{name}")
             return
 
@@ -506,8 +543,18 @@ class PipelineRunner:
 # ---------------------------------------------------------------------------
 
 
-def _subset_jsonl(source: Path, ids: Sequence[str], destination: Path) -> None:
-    rows = _read_jsonl(source)
+def _subset_jsonl(
+    source: Path,
+    ids: Sequence[str],
+    destination: Path,
+    *,
+    record_kind: Optional[str],
+) -> None:
+    if record_kind is None:
+        rows = _read_jsonl(source)
+    else:
+        rows = list(validated_read_jsonl(source, record_kind=record_kind))
+
     by_id: Dict[str, Dict[str, Any]] = {}
     for row in rows:
         input_id = row.get("input_id")
@@ -519,7 +566,17 @@ def _subset_jsonl(source: Path, ids: Sequence[str], destination: Path) -> None:
     missing = [input_id for input_id in ids if input_id not in by_id]
     if missing:
         raise ValueError(f"{source} is missing {len(missing)} requested IDs; examples: {missing[:5]}")
-    _write_jsonl_atomic(destination, (by_id[input_id] for input_id in ids))
+
+    selected_rows = (by_id[input_id] for input_id in ids)
+    if record_kind is None:
+        _write_jsonl_atomic(destination, selected_rows)
+    else:
+        validated_write_jsonl(
+            destination,
+            selected_rows,
+            record_kind=record_kind,
+            enforce_unique_input_ids=True,
+        )
 
 
 def _prepare_active_ids(paths: Paths, smoke_records_per_split: int) -> Dict[str, Path]:
@@ -555,16 +612,21 @@ def _prepare_split_inputs(paths: Paths) -> None:
         "test": _read_ids(paths.inputs / "test_ids.txt"),
     }
     sources = {
-        "sentences": paths.pipeline / "sentences.jsonl",
-        "mes": paths.pipeline / "mes.jsonl",
-        "candidates": paths.pipeline / "candidates.jsonl",
-        "labels": paths.fixed_split / "combined" / "labels.jsonl",
+        "sentences": (paths.pipeline / "sentences.jsonl", "sentences"),
+        "mes": (paths.pipeline / "mes.jsonl", "mes"),
+        "candidates": (paths.pipeline / "candidates.jsonl", "candidates"),
+        "labels": (paths.fixed_split / "combined" / "labels.jsonl", None),
     }
     for split_name, split_ids in ids.items():
         split_dir = paths.inputs / split_name
         split_dir.mkdir(parents=True, exist_ok=True)
-        for name, source in sources.items():
-            _subset_jsonl(source, split_ids, split_dir / f"{name}.jsonl")
+        for name, (source, record_kind) in sources.items():
+            _subset_jsonl(
+                source,
+                split_ids,
+                split_dir / f"{name}.jsonl",
+                record_kind=record_kind,
+            )
         _write_ids(split_dir / "ids.txt", split_ids)
 
 
@@ -639,7 +701,7 @@ def stage_data(runner: PipelineRunner) -> None:
             "--split_name",
             name,
         ]
-        if runner.overwrite:
+        if runner.overwrite or runner.resume:
             command.append("--overwrite")
         runner.run_command(
             stage="data",
@@ -668,7 +730,7 @@ def stage_data(runner: PipelineRunner) -> None:
     ]
     if split.get("dev_size") is not None:
         command += ["--dev_size", str(split["dev_size"])]
-    if runner.overwrite:
+    if runner.overwrite or runner.resume:
         command.append("--overwrite")
     runner.run_command(
         stage="data",
@@ -729,7 +791,7 @@ def stage_attack(runner: PipelineRunner) -> None:
         "--manifest",
         str(p.attack_cache / "attack_manifest.json"),
     ]
-    if runner.overwrite:
+    if runner.overwrite or runner.resume:
         command.append("--overwrite")
     runner.run_command(
         stage="attack",
@@ -765,7 +827,7 @@ def stage_segment(runner: PipelineRunner) -> None:
     ]
     if cfg.get("aggressive_split", False):
         command.append("--aggressive_split")
-    if runner.overwrite:
+    if runner.overwrite or runner.resume:
         command.append("--overwrite")
     runner.run_command(
         stage="segment",
@@ -819,6 +881,7 @@ def stage_extract(runner: PipelineRunner) -> None:
         "OPENAI_EXTRACTION_SEED": str(cfg["seed"]),
         "OPENAI_EXTRACTION_MAX_TOKENS": str(cfg["max_tokens"]),
         "OPENAI_EXTRACTION_MAX_ATTEMPTS": str(cfg["attempts"]),
+        "OPENAI_EXTRACTION_RETRY_BASE_SECONDS": str(cfg["retry_base_seconds"]),
     }
     runner.run_command(
         stage="extract",
@@ -848,7 +911,7 @@ def stage_select_retrieval(runner: PipelineRunner) -> None:
         "--tech_index",
         str(p.attack_cache / "technique_text_index.jsonl"),
         "--labels",
-        str(p.fixed_split / "combined" / "labels.jsonl"),
+        str(p.fixed_split / "development" / "labels.jsonl"),
         "--dev_ids",
         str(p.inputs / "development_ids.txt"),
         "--test_ids",
@@ -876,7 +939,7 @@ def stage_select_retrieval(runner: PipelineRunner) -> None:
         command.append("--normalize_to_parent")
     if runner.smoke_records_per_split > 0:
         command.append("--allow_zero_primary")
-    if runner.overwrite:
+    if runner.overwrite or runner.resume:
         command.append("--overwrite")
     runner.run_command(
         stage="select_retrieval",
@@ -903,7 +966,7 @@ def stage_retrieve(runner: PipelineRunner) -> None:
         }
         print(
             "[plan] selected retrieval configuration unavailable; "
-            f"placeholder alpha={selected['alpha']}, Top-N={selected['topn']} shown"
+            f"plan-preview alpha={selected['alpha']}, Top-N={selected['topn']} shown"
         )
     else:
         selected = _selected_retrieval(selected_path)
@@ -928,7 +991,7 @@ def stage_retrieve(runner: PipelineRunner) -> None:
     ]
     if selected.get("normalize_to_parent", False):
         command.append("--normalize_to_parent")
-    if runner.overwrite:
+    if runner.overwrite or runner.resume:
         command.append("--overwrite")
     runner.run_command(
         stage="retrieve",
@@ -1075,7 +1138,7 @@ def stage_select_beta(runner: PipelineRunner) -> None:
     ]
     if runner.config["evaluation"].get("parent", False):
         command.append("--parent")
-    if runner.overwrite:
+    if runner.overwrite or runner.resume:
         command.append("--overwrite")
     runner.run_command(
         stage="select_beta",
@@ -1095,7 +1158,7 @@ def stage_rerank_test(runner: PipelineRunner) -> None:
     beta_path = runner.paths.beta / "selected_beta.json"
     if runner.plan_only and not beta_path.exists():
         beta = float(runner.config["reranking"].get("initial_beta_for_dev", 0.0))
-        print(f"[plan] selected beta unavailable; placeholder beta={beta} shown for test commands")
+        print(f"[plan] selected beta unavailable; plan-preview beta={beta} shown for test commands")
     else:
         beta = _selected_beta(beta_path)
     modes = [str(value) for value in cfg["test_modes"]]
@@ -1156,6 +1219,12 @@ def stage_evaluate(runner: PipelineRunner) -> None:
     ]
     if cfg.get("parent", False):
         command.append("--parent")
+    if cfg.get("include_retrieval_baseline", False):
+        command += [
+            "--include_retrieval_baseline",
+            "--retrieval_method_name",
+            str(cfg.get("retrieval_method_name", "retrieval")),
+        ]
     runner.run_command(
         stage="evaluate",
         name="held_out_test_evaluation",
@@ -1222,6 +1291,8 @@ def stage_audit(runner: PipelineRunner) -> None:
             "completed_utc": _utc_now(),
             "configuration_sha256": runner.state["configuration_sha256"],
             "smoke_records_per_split": runner.smoke_records_per_split,
+            "run_scope": "smoke" if runner.smoke_records_per_split > 0 else "formal",
+            "eligible_for_formal_reporting": runner.smoke_records_per_split == 0,
             "selected_retrieval": _selected_retrieval(p.retrieval_selection / "selected_retrieval.json"),
             "selected_beta": _selected_beta(p.beta / "selected_beta.json"),
             "artifacts": _path_metadata(required),
@@ -1281,6 +1352,47 @@ def _load_config(root: Path, config_path: Optional[Path]) -> Dict[str, Any]:
             raise ValueError("Pipeline configuration must be a JSON object.")
         _deep_merge(config, supplied)
     return config
+
+
+def _validate_config(config: Mapping[str, Any]) -> None:
+    workspace = str(config.get("workspace", "")).strip()
+    smoke_workspace = str(config.get("smoke_workspace", "")).strip()
+    if not workspace or not smoke_workspace:
+        raise ValueError("Both workspace and smoke_workspace must be configured.")
+    if Path(workspace) == Path(smoke_workspace):
+        raise ValueError("workspace and smoke_workspace must be different paths.")
+
+    extraction = config["extraction"]
+    if float(extraction["retry_base_seconds"]) < 0:
+        raise ValueError("extraction.retry_base_seconds must be non-negative.")
+
+    reranking = config["reranking"]
+    seeds = [int(value) for value in reranking["seeds"]]
+    if not seeds or len(seeds) != len(set(seeds)):
+        raise ValueError("reranking.seeds must be a non-empty list of unique integers.")
+    dev_modes = [str(value) for value in reranking["dev_modes"]]
+    test_modes = [str(value) for value in reranking["test_modes"]]
+    if "full" not in dev_modes:
+        raise ValueError("reranking.dev_modes must include 'full' for beta selection.")
+    unknown = sorted((set(dev_modes) | set(test_modes)) - set(RERANK_MODES))
+    if unknown:
+        raise ValueError(f"Unknown reranking modes in configuration: {unknown}")
+    missing_test = sorted(set(RERANK_MODES) - set(test_modes))
+    if missing_test:
+        raise ValueError(
+            "reranking.test_modes must include all four controlled modes; "
+            f"missing: {missing_test}"
+        )
+
+    evaluation = config["evaluation"]
+    if evaluation.get("include_retrieval_baseline", False):
+        retrieval_name = str(evaluation.get("retrieval_method_name", "")).strip()
+        if not retrieval_name:
+            raise ValueError("evaluation.retrieval_method_name must be non-empty.")
+        if retrieval_name in set(test_modes):
+            raise ValueError(
+                "evaluation.retrieval_method_name must not conflict with a reranking mode."
+            )
 
 
 def _selected_stages(stage: str, through: Optional[str]) -> List[str]:
@@ -1354,6 +1466,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if config_path is not None and not config_path.is_file():
         raise FileNotFoundError(config_path)
     config = _load_config(root, config_path)
+    _validate_config(config)
+    if args.smoke > 0:
+        config["workspace"] = str(config["smoke_workspace"])
     paths = Paths.from_config(root, config)
 
     runner = PipelineRunner(

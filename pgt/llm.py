@@ -89,107 +89,177 @@ def _get_float_cfg(name: str, default: float) -> float:
 
 
 # ---------------------------
-# Rule-based fallback (kept as backup)
+# Generic rule-based fallback (smoke tests only)
 # ---------------------------
 
 def _find_evidence(sentences: Dict[str, str], pattern: str, flags=re.IGNORECASE) -> List[str]:
     rx = RE_ALL(pattern, flags)
-    hits: List[str] = []
-    for eid, s in sentences.items():
-        if rx.search(s):
-            hits.append(eid)
-    return hits
+    return [eid for eid, sentence in sentences.items() if rx.search(sentence)]
+
+
+def _first_nonempty(*values: Optional[str]) -> Optional[str]:
+    for value in values:
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
 
 
 def _rule_based_extract(input_id: str, sentences: Dict[str, str]) -> Dict[str, Any]:
-    preconditions = []
-    entry = []
-    vuln_type = []
-    behaviors = []
-    relations = []
-    impacts = []
-    errors: List[str] = []
+    """Create a conservative, product-agnostic fallback record.
 
-    ev_jndi = _find_evidence(sentences, r"\bJNDI\b")
-    ev_ldap = _find_evidence(sentences, r"\bLDAP\b")
-    if ev_jndi or ev_ldap:
-        vuln_type.append({
-            "type": "injection",
-            "subtype": "JNDI/LDAP endpoint control",
-            "evidence_ids": sorted(set(ev_jndi + ev_ldap)),
-            "confidence": 0.6,
+    This path exists only to exercise file and schema interfaces without an API
+    call.  Formal experiments disable it.  The rules use broad vulnerability
+    language and contain no CVE-family, product, protocol, or technique-specific
+    exceptions.
+    """
+
+    preconditions: List[Dict[str, Any]] = []
+    entry: List[Dict[str, Any]] = []
+    vuln_type: List[Dict[str, Any]] = []
+    behaviors: List[Dict[str, Any]] = []
+    relations: List[Dict[str, Any]] = []
+    impacts: List[Dict[str, Any]] = []
+
+    remote_ids = _find_evidence(
+        sentences,
+        r"remote attacker|network-adjacent|over (?:a|the) network|send(?:ing)? (?:a )?(?:crafted )?(?:request|packet|message|input)|network service|remote request",
+    )
+    local_ids = _find_evidence(
+        sentences,
+        r"local attacker|local user|authenticated user|requires? authentication|with (?:local|valid) credentials",
+    )
+    interaction_ids = _find_evidence(
+        sentences,
+        r"user interaction|victim (?:opens|visits|loads|views)|persuad(?:e|es|ed|ing) (?:a )?user",
+    )
+    if remote_ids:
+        preconditions.append({
+            "condition": "attacker can reach the affected component or submit remote input",
+            "evidence_ids": remote_ids,
+            "confidence": 0.45,
+        })
+    elif local_ids:
+        preconditions.append({
+            "condition": "attacker has local or authenticated access",
+            "evidence_ids": local_ids,
+            "confidence": 0.45,
+        })
+    elif interaction_ids:
+        preconditions.append({
+            "condition": "successful exploitation requires user interaction",
+            "evidence_ids": interaction_ids,
+            "confidence": 0.45,
         })
 
-    ev_rce = _find_evidence(sentences, r"execute arbitrary code|remote code execution|code execution")
-    if ev_rce:
-        impacts.append({
-            "type": "code_execution",
-            "evidence_ids": ev_rce,
-            "confidence": 0.6,
-        })
-
-    ev_entry = _find_evidence(sentences, r"configuration|log messages|parameters|SMBv1|server")
-    if ev_entry:
+    network_entry_ids = _find_evidence(
+        sentences,
+        r"request|packet|message|header|parameter|network service|endpoint|socket|protocol|API",
+    )
+    file_entry_ids = _find_evidence(
+        sentences,
+        r"crafted file|document|archive|image|media file|configuration file|uploaded file|attachment",
+    )
+    local_entry_ids = _find_evidence(
+        sentences,
+        r"command line|environment variable|local interface|system call|device input|console",
+    )
+    if network_entry_ids:
         entry.append({
-            "vector": "external input surface",
-            "detail": "config/logs/params or network service",
-            "evidence_ids": ev_entry,
+            "vector": "network or application request",
+            "detail": "attacker-controlled request, message, or parameter",
+            "evidence_ids": network_entry_ids,
+            "confidence": 0.4,
+        })
+    elif file_entry_ids:
+        entry.append({
+            "vector": "crafted file or document",
+            "detail": "attacker-controlled file content",
+            "evidence_ids": file_entry_ids,
+            "confidence": 0.4,
+        })
+    elif local_entry_ids:
+        entry.append({
+            "vector": "local input interface",
+            "detail": "attacker-controlled local input",
+            "evidence_ids": local_entry_ids,
             "confidence": 0.4,
         })
 
-    ev_attacker_ctrl = _find_evidence(sentences, r"attacker controlled|attacker-controlled")
-    if ev_attacker_ctrl:
-        preconditions.append({
-            "condition": "attacker controls an external endpoint / input",
-            "evidence_ids": ev_attacker_ctrl,
-            "confidence": 0.6,
-        })
+    weakness_patterns = [
+        ("injection", "command or code injection", r"command injection|code injection|SQL injection|script injection|template injection|expression injection"),
+        ("memory_corruption", "memory-safety violation", r"buffer overflow|out-of-bounds|use-after-free|double free|memory corruption|integer overflow"),
+        ("path_traversal", "path traversal", r"path traversal|directory traversal"),
+        ("deserialization", "unsafe deserialization", r"unsafe deserialization|insecure deserialization|deserializ"),
+        ("access_control", "authentication or authorization weakness", r"authentication bypass|authorization bypass|improper access control|missing authorization"),
+        ("race_condition", "race condition", r"race condition|time-of-check|TOCTOU"),
+        ("input_validation", "improper input validation", r"improper input validation|insufficient validation|fails? to validate|does not validate"),
+    ]
+    for weakness_type, subtype, pattern in weakness_patterns:
+        evidence_ids = _find_evidence(sentences, pattern)
+        if evidence_ids:
+            vuln_type.append({
+                "type": weakness_type,
+                "subtype": subtype,
+                "evidence_ids": evidence_ids,
+                "confidence": 0.5,
+            })
+            break
 
-    ev_crafted = _find_evidence(sentences, r"crafted packets|crafted")
-    if ev_crafted:
-        preconditions.append({
-            "condition": "attacker can send crafted network input",
-            "evidence_ids": ev_crafted,
-            "confidence": 0.6,
-        })
+    impact_patterns = [
+        ("code_execution", "execute arbitrary code|remote code execution|code execution"),
+        ("privilege_escalation", "gain elevated privileges|privilege escalation|execute with .* privileges"),
+        ("denial_of_service", "denial of service|cause a crash|application crash|resource exhaustion"),
+        ("information_disclosure", "information disclosure|sensitive information|read arbitrary files|leak(?:age)? of"),
+        ("data_modification", "modify arbitrary|write arbitrary|delete arbitrary|tamper with"),
+        ("security_bypass", "bypass authentication|bypass authorization|bypass security"),
+    ]
+    for impact_type, pattern in impact_patterns:
+        evidence_ids = _find_evidence(sentences, pattern)
+        if evidence_ids:
+            impacts.append({
+                "type": impact_type,
+                "evidence_ids": evidence_ids,
+                "confidence": 0.5,
+            })
+            break
 
-    ev_allows = _find_evidence(sentences, r"\ballows\b")
-    ev_via = _find_evidence(sentences, r"\bvia\b")
-    if ev_allows and ev_rce:
-        ev = sorted(set(ev_allows + ev_rce + ev_via))
+    exploit_ids = _find_evidence(
+        sentences,
+        r"allows? (?:a |an )?(?:remote |local |authenticated )?attacker|could allow|may allow|by sending|via (?:a )?crafted|successful exploitation",
+    )
+    behavior_evidence = list(
+        dict.fromkeys(
+            exploit_ids
+            + (entry[0]["evidence_ids"] if entry else [])
+            + (vuln_type[0]["evidence_ids"] if vuln_type else [])
+            + (impacts[0]["evidence_ids"] if impacts else [])
+        )
+    )
+    if behavior_evidence:
+        impact_name = impacts[0]["type"] if impacts else None
+        target = _first_nonempty(
+            entry[0].get("detail") if entry else None,
+            "affected component",
+        )
         behaviors.append({
-            "action": "exploit",
-            "target": "vulnerable service/component",
-            "impact": "code execution",
-            "evidence_ids": ev,
-            "confidence": 0.55,
-        })
-
-    ev_not_protect = _find_evidence(sentences, r"do not protect|does not protect|not protect")
-    if ev_not_protect and (ev_jndi or ev_ldap or ev_attacker_ctrl):
-        ev = sorted(set(ev_not_protect + ev_jndi + ev_ldap + ev_attacker_ctrl))
-        behaviors.append({
-            "action": "trigger jndi lookup / remote fetch",
-            "target": "attacker-controlled LDAP/JNDI endpoint",
-            "impact": "possible code execution",
-            "evidence_ids": ev,
-            "confidence": 0.55,
-        })
-
-    if ev_rce and not any(b.get("impact") == "code execution" for b in behaviors):
-        behaviors.append({
-            "action": "exploit",
-            "target": None,
-            "impact": "code execution",
-            "evidence_ids": ev_rce,
+            "action": "submit crafted input and trigger the vulnerable operation",
+            "target": target,
+            "impact": impact_name,
+            "evidence_ids": behavior_evidence,
             "confidence": 0.35,
         })
 
-    def add_relation(src: str, relation_type: str, dst: str, left: Dict[str, Any], right: Dict[str, Any]) -> None:
-        left_eids = [x for x in left.get("evidence_ids", []) if isinstance(x, str)]
-        right_eids = [x for x in right.get("evidence_ids", []) if isinstance(x, str)]
-        shared = [x for x in left_eids if x in set(right_eids)]
-        evidence_ids = shared or list(dict.fromkeys(left_eids + right_eids))
+    def add_relation(
+        src: str,
+        relation_type: str,
+        dst: str,
+        left: Dict[str, Any],
+        right: Dict[str, Any],
+    ) -> None:
+        left_ids = [value for value in left.get("evidence_ids", []) if isinstance(value, str)]
+        right_ids = [value for value in right.get("evidence_ids", []) if isinstance(value, str)]
+        shared = [value for value in left_ids if value in set(right_ids)]
+        evidence_ids = shared or list(dict.fromkeys(left_ids + right_ids))
         if not evidence_ids:
             return
         confidence = min(float(left.get("confidence", 0.5)), float(right.get("confidence", 0.5)))
@@ -222,7 +292,11 @@ def _rule_based_extract(input_id: str, sentences: Dict[str, str]) -> Dict[str, A
         "behaviors": behaviors,
         "relations": relations,
         "impacts": impacts,
-        "_validation_errors": errors,
+        "_validation_errors": [],
+        "_fallback_warnings": (
+            [] if any((preconditions, entry, vuln_type, behaviors, impacts))
+            else ["generic fallback found no structured vulnerability signal"]
+        ),
     }
 
 
@@ -920,15 +994,18 @@ def call_llm_extract(input_id: str, sentences: Dict[str, str]) -> Dict[str, Any]
         "prompt_sha256": prompt_hash,
     }
 
+    openai_runtime: Dict[str, Any] = {}
     try:
-        from .openai_client import get_openai_client
+        from .openai_client import get_openai_client, get_openai_runtime_config
+        openai_runtime = get_openai_runtime_config()
         client = get_openai_client()
     except Exception as e:
         fb = _sanitize_evidence_ids(_rule_based_extract(input_id, sentences), valid_ids)
         fb["_used_llm"] = False
-        fb["_validation_errors"] = [f"llm_client_init_failed: {type(e).__name__}: {e}"]
+        fb["_runtime_errors"] = [f"llm_client_init_failed: {type(e).__name__}: {e}"]
         fb["_provenance"] = {
             **base_provenance,
+            "openai_runtime": openai_runtime,
             "mode": "rule_based_fallback",
             "fallback_reason": "client_initialisation_failed",
         }
@@ -963,6 +1040,7 @@ def call_llm_extract(input_id: str, sentences: Dict[str, str]) -> Dict[str, Any]
             extraction = _sanitize_evidence_ids(extraction, valid_ids)
             extraction["_provenance"] = {
                 **base_provenance,
+                "openai_runtime": openai_runtime,
                 "mode": "llm",
                 "attempts_used": attempt,
                 "returned_model": getattr(resp, "model", None),
@@ -978,9 +1056,12 @@ def call_llm_extract(input_id: str, sentences: Dict[str, str]) -> Dict[str, Any]
 
     fb = _sanitize_evidence_ids(_rule_based_extract(input_id, sentences), valid_ids)
     fb["_used_llm"] = False
-    fb["_validation_errors"] = [f"llm_failed: {type(last_err).__name__}: {last_err}"] if last_err else []
+    fb["_runtime_errors"] = (
+        [f"llm_failed: {type(last_err).__name__}: {last_err}"] if last_err else []
+    )
     fb["_provenance"] = {
         **base_provenance,
+        "openai_runtime": openai_runtime,
         "mode": "rule_based_fallback",
         "attempts_used": max_attempts,
         "fallback_reason": "all_llm_attempts_failed",

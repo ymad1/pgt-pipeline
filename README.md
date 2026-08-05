@@ -8,7 +8,7 @@ The formal experiment is executed through one fail-fast entry point:
 python tools/run_pipeline.py --config configs/reviewer2_experiment.json
 ```
 
-The orchestrator is the source of truth for the paper experiment. Older exploratory scripts may remain in the repository for historical reference, but they are not part of the formal pipeline unless they are called by `tools/run_pipeline.py`.
+The orchestrator is the source of truth for the paper experiment. Obsolete exploratory, hard-coded, and one-off debugging scripts have been removed from the active repository.
 
 ## Formal pipeline
 
@@ -25,11 +25,11 @@ Raw X/y CSV files
   -> evidence/MES candidate retrieval
   -> development-only beta selection
   -> four controlled test rerankers
-  -> repeated-run evaluation and statistical tests
+  -> retrieval-only baseline plus repeated-run evaluation and statistical tests
   -> coverage audits and final run manifest
 ```
 
-The four held-out reranking conditions use the same CVEs, candidate set, model settings, candidate budget, and random seeds:
+The four held-out reranking conditions use the same CVEs, candidate set, model settings, candidate budget, and random seeds. A retrieval-only ranking derived from that same shared candidate order is reported as an additional non-LLM baseline:
 
 | Mode | Information supplied to the reranker |
 |---|---|
@@ -45,7 +45,7 @@ The formal workflow enforces the following controls:
 - Base-CVE deduplication and union of labels from duplicate or augmented records.
 - A fixed multilabel development/test split with explicit overlap checks.
 - Development-only selection of retrieval `alpha`, candidate budget `Top-N`, and reranking `beta`.
-- Fixed model snapshots, temperatures, seeds, token budgets, retry settings, and prompt hashes.
+- Fixed model snapshots, temperatures, seeds, token budgets, extraction retry intervals, reranking retry settings, and prompt hashes.
 - Active ATT&CK technique filtering with ATT&CK version and source-file hashes.
 - Deterministic evidence IDs and source-text integrity checks.
 - Schema validation at every JSONL boundary.
@@ -197,11 +197,11 @@ python tools/run_pipeline.py \
   --overwrite
 ```
 
-Smoke-run parameter selections and metrics are interface checks only. They must not be reported as paper results.
+Smoke-run parameter selections and metrics are interface checks only. They must not be reported as paper results. Smoke runs are automatically isolated in `runs/reviewer2_v2_smoke/`, while the formal run uses `runs/reviewer2_v2/`. Resume checks also reject mixing different smoke/full scopes or changed output hashes.
 
 ### 4. Run the formal experiment
 
-Use a new or empty workspace and the committed configuration:
+Use the committed configuration. The formal workspace is separate from the smoke workspace:
 
 ```bash
 python tools/run_pipeline.py \
@@ -216,7 +216,7 @@ python tools/run_pipeline.py \
   --resume
 ```
 
-Resume is rejected when the configuration hash differs from the existing run state.
+Resume is rejected when the configuration hash or smoke/full scope differs from the existing run state. Previously completed outputs are also re-hashed before reuse.
 
 ## Stage-level execution
 
@@ -245,10 +245,11 @@ data -> attack -> segment -> extract -> select_retrieval -> retrieve
 
 ## Output structure
 
-The default workspace is:
+The configured workspaces are:
 
 ```text
-runs/reviewer2_v2/
+runs/reviewer2_v2/          formal experiment
+runs/reviewer2_v2_smoke/    smoke experiment
 ```
 
 Important outputs include:
@@ -302,7 +303,7 @@ final_run_manifest.json
 
 ## Evaluation definitions
 
-The formal evaluator reports sample-level and label-level ranking metrics, including:
+The formal evaluator compares the retrieval-only baseline and the four controlled reranking modes, and reports sample-level and label-level ranking metrics, including:
 
 - Hit@K, Precision@K, Recall@K, and AP@K.
 - Mean Reciprocal Rank.
@@ -325,7 +326,7 @@ Before reporting results, verify all of the following:
 5. No fallback extraction is present in the formal run.
 6. Retrieval parameters were selected only from the development split.
 7. Beta was selected only from the development split.
-8. All four test methods use the same candidates and seeds.
+8. All four reranking methods use the same candidates and seeds, and the retrieval baseline is derived from that same shared order.
 9. All expected reranking runs completed without missing CVEs.
 10. `final_run_manifest.json` and evaluation manifests exist.
 11. Smoke outputs are kept separate from formal outputs.

@@ -660,7 +660,19 @@ def _build_mes_record(
             structural_edge_indices.insert(0, precondition_edge_index)
 
     selected_structural_set = set(structural_ids)
-    selected_evidence_set = set(evidence_cover)
+
+    # Preserve source-graph node attributes exactly.  Structural nodes carry
+    # their complete evidence_ids arrays, so the MES includes the traceability
+    # closure for every selected structural node rather than pruning attributes.
+    # ``evidence_cover`` remains the minimum cover used by path selection and is
+    # recorded separately in selection_trace.
+    output_evidence_ids = tuple(
+        sorted(
+            set().union(*(support.get(node_id, set()) for node_id in structural_ids)),
+            key=_evidence_sort_key,
+        )
+    )
+    selected_evidence_set = set(output_evidence_ids)
     evidence_node_ids: Dict[str, str] = {}
     for node_id, node in node_map.items():
         if node.get("type") != "Evidence":
@@ -669,8 +681,9 @@ def _build_mes_record(
         if isinstance(eid, str) and eid in selected_evidence_set:
             evidence_node_ids[eid] = node_id
 
-    # Every selected evidence id must correspond to an existing Evidence node.
-    missing_evidence_nodes = sorted(selected_evidence_set - set(evidence_node_ids), key=_evidence_sort_key)
+    missing_evidence_nodes = sorted(
+        selected_evidence_set - set(evidence_node_ids), key=_evidence_sort_key
+    )
     if missing_evidence_nodes:
         warnings.append("missing_evidence_nodes:" + ",".join(missing_evidence_nodes))
 
@@ -691,7 +704,7 @@ def _build_mes_record(
     selected_edge_indices: Set[int] = set(structural_edge_indices)
     selected_edge_indices.update(_find_mentions_edges(cve_id, selected_structural_set, edges))
     for node_id in structural_ids:
-        for eid in evidence_cover:
+        for eid in output_evidence_ids:
             index = support_edge_index.get((node_id, eid))
             if index is not None:
                 selected_edge_indices.add(index)
@@ -723,7 +736,8 @@ def _build_mes_record(
             }
             for index in structural_edge_indices
         ],
-        "evidence_ids": list(evidence_cover),
+        "evidence_ids": list(output_evidence_ids),
+        "minimum_evidence_cover": list(evidence_cover),
     }
     signature = hashlib.sha256(
         json.dumps(signature_payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
@@ -742,13 +756,14 @@ def _build_mes_record(
                 "exact_enumeration_then_deterministic_greedy_above_limit"
             ),
             "subgraph_constraint": "all_nodes_and_edges_copied_from_local_graph",
+            "traceability_closure": "all supported_by edges for selected structural nodes",
         },
         "status": status,
         "complete_core_chain": selected.complete,
         "chain": structural_ids,
         "chain_types": chain_types,
         "structural_node_ids": structural_ids,
-        "evidence_ids": list(evidence_cover),
+        "evidence_ids": list(output_evidence_ids),
         "nodes": nodes,
         "edges": selected_edges,
         "compact_text": compact_text,
@@ -756,6 +771,8 @@ def _build_mes_record(
             **selection_trace,
             "precondition_added": precondition_id,
             "selected_structural_edge_count": len(structural_edge_indices),
+            "minimum_evidence_cover": list(evidence_cover),
+            "traceability_closure_evidence_ids": list(output_evidence_ids),
             "selected_traceability_edge_count": len(selected_edges) - len(structural_edge_indices),
         },
         "warnings": warnings,

@@ -46,7 +46,11 @@ from .llm import (
     PROMPT_VERSION,
     call_llm_extract,
 )
-from .schema import validate_evidence_ids
+from .schema import (
+    assert_valid_local_graph_record,
+    assert_valid_mes_record,
+    validate_evidence_ids,
+)
 
 
 ORCHESTRATOR_VERSION = "extract-orchestrator-v2.0.0"
@@ -334,6 +338,7 @@ def _runtime_signature(extraction: Mapping[str, Any]) -> Dict[str, Any]:
         "response_format",
         "max_attempts",
         "retry_base_seconds",
+        "openai_runtime",
         "mode",
     )
     return {key: provenance.get(key) for key in keys}
@@ -490,6 +495,8 @@ def run_pipeline(args: argparse.Namespace) -> Dict[str, Any]:
             "llm_records": 0,
             "fallback_records": 0,
             "validation_error_records": 0,
+            "runtime_error_records": 0,
+            "fallback_warning_records": 0,
             "failed_records": 0,
         },
         "local_graph": {
@@ -551,6 +558,12 @@ def run_pipeline(args: argparse.Namespace) -> Dict[str, Any]:
                     counters["extraction"]["records_reused_on_resume"] += 1
                     counters["extraction"]["llm_records" if used_llm else "fallback_records"] += 1
                     counters["extraction"]["validation_error_records"] += int(bool(validation_errors))
+                    counters["extraction"]["runtime_error_records"] += int(
+                        bool(extraction.get("_runtime_errors"))
+                    )
+                    counters["extraction"]["fallback_warning_records"] += int(
+                        bool(extraction.get("_fallback_warnings"))
+                    )
                 except Exception as exc:
                     fail("extraction", input_id, exc)
                 continue
@@ -571,6 +584,12 @@ def run_pipeline(args: argparse.Namespace) -> Dict[str, Any]:
                 counters["extraction"]["records_extracted_now"] += 1
                 counters["extraction"]["llm_records" if used_llm else "fallback_records"] += 1
                 counters["extraction"]["validation_error_records"] += int(bool(validation_errors))
+                counters["extraction"]["runtime_error_records"] += int(
+                    bool(extraction.get("_runtime_errors"))
+                )
+                counters["extraction"]["fallback_warning_records"] += int(
+                    bool(extraction.get("_fallback_warnings"))
+                )
             except Exception as exc:
                 fail("extraction", input_id, exc)
 
@@ -591,6 +610,7 @@ def run_pipeline(args: argparse.Namespace) -> Dict[str, Any]:
                 if str(graph.get("input_id", "")) != input_id:
                     fail("local_graph", input_id, ValueError("existing graph input_id mismatch"))
                     continue
+                assert_valid_local_graph_record(graph)
                 counters["local_graph"]["graphs_reused_on_resume"] += 1
             else:
                 try:
@@ -599,6 +619,7 @@ def run_pipeline(args: argparse.Namespace) -> Dict[str, Any]:
                         sentences_lookup=sentence_lookup,
                         filter_aka_for_behavior_impact=not args.no_filter_aka,
                     )
+                    assert_valid_local_graph_record(graph)
                     _write_json_atomic(graph_path, graph)
                     counters["local_graph"]["graphs_written"] += 1
                 except Exception as exc:
@@ -615,6 +636,7 @@ def run_pipeline(args: argparse.Namespace) -> Dict[str, Any]:
             if input_id in mes_by_id:
                 counters["mes"]["records_reused_on_resume"] += 1
                 mes = mes_by_id[input_id]
+                assert_valid_mes_record(mes, source_graph=graph)
             else:
                 try:
                     mes = _build_mes_record(
@@ -623,6 +645,7 @@ def run_pipeline(args: argparse.Namespace) -> Dict[str, Any]:
                         exact_cover_limit=args.mes_exact_cover_limit,
                         include_precondition=bool(args.mes_include_precondition),
                     )
+                    assert_valid_mes_record(mes, source_graph=graph)
                     _append_jsonl(mes_output, mes)
                     mes_by_id[input_id] = mes
                     counters["mes"]["records_written"] += 1

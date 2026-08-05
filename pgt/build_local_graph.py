@@ -134,7 +134,7 @@ def _normalise_evidence_ids(value: Any) -> List[str]:
             continue
         seen.add(eid)
         out.append(eid)
-    return out
+    return sorted(out, key=lambda eid: (int(eid[1:]), eid))
 
 
 def _normalise_confidence(value: Any) -> Optional[float]:
