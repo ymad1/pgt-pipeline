@@ -29,13 +29,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence
 
-SCRIPT_VERSION = "reviewer2-pipeline-v1.0.0"
+SCRIPT_VERSION = "reviewer2-pipeline-v1.1.0"
 DEFAULT_CONFIG_NAME = "pipeline_config.json"
 STAGE_ORDER = (
     "data",
     "attack",
     "segment",
     "extract",
+    "select_retrieval",
     "retrieve",
     "rerank_dev",
     "select_beta",
@@ -236,11 +237,20 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "mes_exact_cover_limit": 20,
         "mes_include_precondition": False,
     },
-    "retrieval": {
-        "topn": 20,
-        "alpha": 0.60,
+    "retrieval_selection": {
+        "alphas": "0.00,0.20,0.40,0.50,0.60,0.80,1.00",
+        "topns": "5,10,15,20,30,50",
         "score_normalization": "none",
         "normalize_to_parent": True,
+        "primary_metric": "candidate_coverage",
+        "primary_tolerance": 0.005,
+        "bootstrap_repetitions": 2000,
+        "confidence": 0.95,
+        "seed": 20260805,
+    },
+    "retrieval": {
+        "fallback_topn_for_plan": 20,
+        "fallback_alpha_for_plan": 0.60,
     },
     "reranking": {
         "model": "gpt-4o-mini-2024-07-18",
@@ -286,6 +296,7 @@ class Paths:
     attack_cache: Path
     inputs: Path
     pipeline: Path
+    retrieval_selection: Path
     rerank_dev: Path
     beta: Path
     rerank_test: Path
@@ -305,6 +316,7 @@ class Paths:
             attack_cache=workspace / "attack_cache",
             inputs=workspace / "inputs",
             pipeline=workspace / "pipeline",
+            retrieval_selection=workspace / "retrieval_selection",
             rerank_dev=workspace / "reranking" / "development",
             beta=workspace / "beta_selection",
             rerank_test=workspace / "reranking" / "test",
@@ -564,6 +576,26 @@ def _selected_beta(path: Path) -> float:
     return beta
 
 
+def _selected_retrieval(path: Path) -> Dict[str, Any]:
+    payload = _read_json(path)
+    alpha = float(payload["selected_alpha"])
+    topn = int(payload["selected_topn"])
+    normalization = str(payload["score_normalization"])
+    parent_normalization = bool(payload["parent_normalization"])
+    if not 0.0 <= alpha <= 1.0:
+        raise ValueError(f"Selected alpha outside [0,1]: {alpha}")
+    if topn <= 0:
+        raise ValueError(f"Selected Top-N must be positive: {topn}")
+    if normalization not in {"none", "minmax"}:
+        raise ValueError(f"Unsupported selected score normalization: {normalization}")
+    return {
+        "alpha": alpha,
+        "topn": topn,
+        "score_normalization": normalization,
+        "normalize_to_parent": parent_normalization,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Stages
 # ---------------------------------------------------------------------------
@@ -802,9 +834,79 @@ def stage_extract(runner: PipelineRunner) -> None:
     )
 
 
-def stage_retrieve(runner: PipelineRunner) -> None:
-    cfg = runner.config["retrieval"]
+def stage_select_retrieval(runner: PipelineRunner) -> None:
+    cfg = runner.config["retrieval_selection"]
     p = runner.paths
+    command = [
+        runner.python,
+        "-m",
+        "pgt.sweep_retrieval",
+        "--sentences",
+        str(p.pipeline / "sentences.jsonl"),
+        "--mes",
+        str(p.pipeline / "mes.jsonl"),
+        "--tech_index",
+        str(p.attack_cache / "technique_text_index.jsonl"),
+        "--labels",
+        str(p.fixed_split / "combined" / "labels.jsonl"),
+        "--dev_ids",
+        str(p.inputs / "development_ids.txt"),
+        "--test_ids",
+        str(p.inputs / "test_ids.txt"),
+        "--output_dir",
+        str(p.retrieval_selection),
+        "--alphas",
+        str(cfg["alphas"]),
+        "--topns",
+        str(cfg["topns"]),
+        "--score_normalization",
+        str(cfg["score_normalization"]),
+        "--primary_metric",
+        str(cfg["primary_metric"]),
+        "--primary_tolerance",
+        str(cfg["primary_tolerance"]),
+        "--bootstrap_repetitions",
+        str(cfg["bootstrap_repetitions"]),
+        "--confidence",
+        str(cfg["confidence"]),
+        "--seed",
+        str(cfg["seed"]),
+    ]
+    if cfg.get("normalize_to_parent", False):
+        command.append("--normalize_to_parent")
+    if runner.smoke_records_per_split > 0:
+        command.append("--allow_zero_primary")
+    if runner.overwrite:
+        command.append("--overwrite")
+    runner.run_command(
+        stage="select_retrieval",
+        name="select_retrieval_on_development",
+        command=command,
+        expected_outputs=[
+            p.retrieval_selection / "selected_retrieval.json",
+            p.retrieval_selection / "retrieval_sweep.csv",
+            p.retrieval_selection / "retrieval_selection_manifest.json",
+        ],
+    )
+
+
+def stage_retrieve(runner: PipelineRunner) -> None:
+    p = runner.paths
+    selected_path = p.retrieval_selection / "selected_retrieval.json"
+    if runner.plan_only and not selected_path.exists():
+        fallback = runner.config["retrieval"]
+        selected = {
+            "alpha": float(fallback["fallback_alpha_for_plan"]),
+            "topn": int(fallback["fallback_topn_for_plan"]),
+            "score_normalization": str(runner.config["retrieval_selection"]["score_normalization"]),
+            "normalize_to_parent": bool(runner.config["retrieval_selection"].get("normalize_to_parent", False)),
+        }
+        print(
+            "[plan] selected retrieval configuration unavailable; "
+            f"placeholder alpha={selected['alpha']}, Top-N={selected['topn']} shown"
+        )
+    else:
+        selected = _selected_retrieval(selected_path)
     command = [
         runner.python,
         "-m",
@@ -818,13 +920,13 @@ def stage_retrieve(runner: PipelineRunner) -> None:
         "--output",
         str(p.pipeline / "candidates.jsonl"),
         "--topn",
-        str(cfg["topn"]),
+        str(selected["topn"]),
         "--alpha",
-        str(cfg["alpha"]),
+        str(selected["alpha"]),
         "--score_normalization",
-        str(cfg["score_normalization"]),
+        str(selected["score_normalization"]),
     ]
-    if cfg.get("normalize_to_parent", False):
+    if selected.get("normalize_to_parent", False):
         command.append("--normalize_to_parent")
     if runner.overwrite:
         command.append("--overwrite")
@@ -882,7 +984,11 @@ def _rerank_command(
         "--mode",
         mode,
         "--topk",
-        str(runner.config["retrieval"]["topn"]),
+        str(
+            _selected_retrieval(p.retrieval_selection / "selected_retrieval.json")["topn"]
+            if (p.retrieval_selection / "selected_retrieval.json").exists()
+            else runner.config["retrieval"]["fallback_topn_for_plan"]
+        ),
         "--beta",
         str(beta),
         "--model",
@@ -1102,6 +1208,8 @@ def stage_audit(runner: PipelineRunner) -> None:
             p.pipeline / "sentences.jsonl.manifest.json",
             p.pipeline / "extraction.jsonl.manifest.json",
             p.pipeline / "candidates.jsonl.summary.json",
+            p.retrieval_selection / "selected_retrieval.json",
+            p.retrieval_selection / "retrieval_selection_manifest.json",
             p.beta / "selected_beta.json",
             p.evaluation / "evaluation_manifest.json",
             p.audit / "test_candidate_coverage" / "audit_manifest.json",
@@ -1114,6 +1222,7 @@ def stage_audit(runner: PipelineRunner) -> None:
             "completed_utc": _utc_now(),
             "configuration_sha256": runner.state["configuration_sha256"],
             "smoke_records_per_split": runner.smoke_records_per_split,
+            "selected_retrieval": _selected_retrieval(p.retrieval_selection / "selected_retrieval.json"),
             "selected_beta": _selected_beta(p.beta / "selected_beta.json"),
             "artifacts": _path_metadata(required),
         }
@@ -1132,6 +1241,7 @@ STAGE_FUNCTIONS = {
     "attack": stage_attack,
     "segment": stage_segment,
     "extract": stage_extract,
+    "select_retrieval": stage_select_retrieval,
     "retrieve": stage_retrieve,
     "rerank_dev": stage_rerank_dev,
     "select_beta": stage_select_beta,
@@ -1151,6 +1261,7 @@ def _validate_project(root: Path) -> None:
         root / "pgt" / "__init__.py",
         root / "pgt" / "extract.py",
         root / "pgt" / "retrieve_candidates.py",
+        root / "pgt" / "sweep_retrieval.py",
         root / "pgt" / "rerank.py",
         root / "pgt" / "compare_rankers.py",
         root / "tools" / "make_cve2attck_jsonl.py",
