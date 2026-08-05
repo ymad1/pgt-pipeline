@@ -169,8 +169,6 @@ class ExtractionRecord(TypedDict):
     impacts: List[ImpactRecord]
     _used_llm: NotRequired[bool]
     _validation_errors: NotRequired[List[str]]
-    _runtime_errors: NotRequired[List[str]]
-    _fallback_warnings: NotRequired[List[str]]
     _provenance: NotRequired[Dict[str, Any]]
 
 
@@ -644,10 +642,6 @@ def validate_extraction_record(
         _err(errors, "root._used_llm", "type", "must be boolean when present")
     if "_validation_errors" in record:
         _validate_string_list(record.get("_validation_errors"), "root._validation_errors", errors)
-    if "_runtime_errors" in record:
-        _validate_string_list(record.get("_runtime_errors"), "root._runtime_errors", errors)
-    if "_fallback_warnings" in record:
-        _validate_string_list(record.get("_fallback_warnings"), "root._fallback_warnings", errors)
     if "_provenance" in record and not _is_mapping(record.get("_provenance")):
         _err(errors, "root._provenance", "type", "must be an object when present")
     return errors
