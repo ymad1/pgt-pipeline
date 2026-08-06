@@ -29,8 +29,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence
 
-from tqdm.auto import tqdm
-
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPOSITORY_ROOT))
@@ -38,7 +36,7 @@ if str(_REPOSITORY_ROOT) not in sys.path:
 from pgt.io import read_jsonl as validated_read_jsonl
 from pgt.io import write_jsonl as validated_write_jsonl
 
-SCRIPT_VERSION = "reviewer2-pipeline-v1.3.0"
+SCRIPT_VERSION = "reviewer2-pipeline-v1.2.1"
 DEFAULT_CONFIG_NAME = "pipeline_config.json"
 STAGE_ORDER = (
     "data",
@@ -363,8 +361,6 @@ class PipelineRunner:
         overwrite: bool,
         resume: bool,
         smoke_records_per_split: int,
-        test_seed_filter: Optional[Sequence[int]] = None,
-        test_mode_filter: Optional[Sequence[str]] = None,
     ) -> None:
         self.root = root
         self.config = config
@@ -373,8 +369,6 @@ class PipelineRunner:
         self.overwrite = overwrite
         self.resume = resume
         self.smoke_records_per_split = smoke_records_per_split
-        self.test_seed_filter = tuple(int(value) for value in (test_seed_filter or ()))
-        self.test_mode_filter = tuple(str(value) for value in (test_mode_filter or ()))
         self.python = sys.executable
         self.state: Dict[str, Any] = {
             "script_version": SCRIPT_VERSION,
@@ -1166,107 +1160,41 @@ def stage_select_beta(runner: PipelineRunner) -> None:
     )
 
 
-def _selected_test_seeds(runner: PipelineRunner) -> List[int]:
-    configured = [int(value) for value in runner.config["reranking"]["seeds"]]
-    if not runner.test_seed_filter:
-        return configured
-    unknown = [value for value in runner.test_seed_filter if value not in configured]
-    if unknown:
-        raise ValueError(
-            f"Requested test seed(s) are not present in reranking.seeds: {unknown}; "
-            f"configured={configured}"
-        )
-    return list(dict.fromkeys(runner.test_seed_filter))
-
-
-def _selected_test_modes(runner: PipelineRunner) -> List[str]:
-    configured = [str(value) for value in runner.config["reranking"]["test_modes"]]
-    if not runner.test_mode_filter:
-        return configured
-    unknown = [value for value in runner.test_mode_filter if value not in configured]
-    if unknown:
-        raise ValueError(
-            f"Requested test mode(s) are not present in reranking.test_modes: {unknown}; "
-            f"configured={configured}"
-        )
-    return list(dict.fromkeys(runner.test_mode_filter))
-
-
-def _filtered_test_scope(runner: PipelineRunner) -> bool:
-    return bool(runner.test_seed_filter or runner.test_mode_filter)
-
-
 def stage_rerank_test(runner: PipelineRunner) -> None:
     _openai_preflight(runner, "rerank_test")
+    cfg = runner.config["reranking"]
     beta_path = runner.paths.beta / "selected_beta.json"
     if runner.plan_only and not beta_path.exists():
         beta = float(runner.config["reranking"].get("initial_beta_for_dev", 0.0))
         print(f"[plan] selected beta unavailable; plan-preview beta={beta} shown for test commands")
     else:
         beta = _selected_beta(beta_path)
-
-    modes = _selected_test_modes(runner)
-    seeds = _selected_test_seeds(runner)
+    modes = [str(value) for value in cfg["test_modes"]]
     for mode in modes:
         if mode not in RERANK_MODES:
             raise ValueError(f"Unknown test reranking mode: {mode}")
-
-    # Seed-major ordering intentionally completes one fully comparable experiment
-    # (generic/evidence/structure/full) before moving to the next random seed.
-    tasks = [(seed, mode) for seed in seeds for mode in modes]
-    test_ids_path = runner.paths.inputs / "test" / "ids.txt"
-    if test_ids_path.is_file():
-        cves_per_batch: str | int = len(_read_ids(test_ids_path))
-    elif runner.plan_only:
-        cves_per_batch = "<prepared test size>"
-    else:
-        raise FileNotFoundError(test_ids_path)
-    print(
-        f"[rerank_test] selected seeds={seeds}; modes={modes}; "
-        f"batches={len(tasks)}; CVEs per batch={cves_per_batch}"
-    )
-
-    progress = tqdm(
-        tasks,
-        desc="rerank_test overall",
-        unit="mode",
-        disable=runner.plan_only,
-        dynamic_ncols=True,
-    )
-    for batch_index, (seed, mode) in enumerate(progress, start=1):
-        progress.set_postfix_str(f"seed={seed} mode={mode}")
-        print(
-            f"[rerank_test] batch {batch_index}/{len(tasks)}: "
-            f"seed={seed}, mode={mode}"
-        )
-        output = runner.paths.rerank_test / mode / f"seed_{seed}.jsonl"
-        runner.run_command(
-            stage="rerank_test",
-            name=f"{mode}_seed_{seed}",
-            command=_rerank_command(
-                runner,
-                split_name="test",
-                mode=mode,
-                seed=seed,
-                beta=beta,
-                output=output,
-            ),
-            expected_outputs=[output, Path(str(output) + ".manifest.json")],
-        )
-
+    for mode in modes:
+        for seed in [int(value) for value in cfg["seeds"]]:
+            output = runner.paths.rerank_test / mode / f"seed_{seed}.jsonl"
+            runner.run_command(
+                stage="rerank_test",
+                name=f"{mode}_seed_{seed}",
+                command=_rerank_command(
+                    runner,
+                    split_name="test",
+                    mode=mode,
+                    seed=seed,
+                    beta=beta,
+                    output=output,
+                ),
+                expected_outputs=[output, Path(str(output) + ".manifest.json")],
+            )
 
 
 def stage_evaluate(runner: PipelineRunner) -> None:
     cfg = runner.config["evaluation"]
+    rerank_cfg = runner.config["reranking"]
     p = runner.paths
-    modes = _selected_test_modes(runner)
-    seeds = _selected_test_seeds(runner)
-    if _filtered_test_scope(runner):
-        seed_tag = "-".join(str(value) for value in seeds)
-        mode_tag = "-".join(modes)
-        evaluation_dir = p.workspace / "evaluation" / "incremental" / f"seeds_{seed_tag}" / mode_tag
-    else:
-        evaluation_dir = p.evaluation
     command = [
         runner.python,
         "-m",
@@ -1274,17 +1202,12 @@ def stage_evaluate(runner: PipelineRunner) -> None:
         "--labels",
         str(p.inputs / "test" / "labels.jsonl"),
     ]
-    for mode in modes:
-        for seed in seeds:
-            run_path = p.rerank_test / mode / f"seed_{seed}.jsonl"
-            if not runner.plan_only and not run_path.is_file():
-                raise FileNotFoundError(
-                    f"Cannot evaluate incomplete test scope; missing reranking file: {run_path}"
-                )
-            command += ["--run", f"{mode}={run_path}"]
+    for mode in [str(value) for value in rerank_cfg["test_modes"]]:
+        for seed in [int(value) for value in rerank_cfg["seeds"]]:
+            command += ["--run", f"{mode}={p.rerank_test / mode / f'seed_{seed}.jsonl'}"]
     command += [
         "--output_dir",
-        str(evaluation_dir),
+        str(p.evaluation),
         "--ks",
         str(cfg["ks"]),
         "--bootstrap_repetitions",
@@ -1315,12 +1238,12 @@ def stage_evaluate(runner: PipelineRunner) -> None:
         name="held_out_test_evaluation",
         command=command,
         expected_outputs=[
-            evaluation_dir / "metric_summary.csv",
-            evaluation_dir / "pairwise_tests.csv",
-            evaluation_dir / "per_technique_recall.csv",
-            evaluation_dir / "long_tail_summary.csv",
-            evaluation_dir / "evaluation_report.json",
-            evaluation_dir / "evaluation_manifest.json",
+            p.evaluation / "metric_summary.csv",
+            p.evaluation / "pairwise_tests.csv",
+            p.evaluation / "per_technique_recall.csv",
+            p.evaluation / "long_tail_summary.csv",
+            p.evaluation / "evaluation_report.json",
+            p.evaluation / "evaluation_manifest.json",
         ],
     )
 
@@ -1648,27 +1571,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--overwrite", action="store_true", help="Replace stage outputs where supported.")
     parser.add_argument("--resume", action="store_true", help="Resume a matching interrupted run.")
     parser.add_argument(
-        "--test_seed",
-        action="append",
-        type=int,
-        default=None,
-        help=(
-            "Restrict rerank_test/evaluate to one or more configured seeds. "
-            "Repeat the option for multiple seeds. This is a runtime filter and does not alter "
-            "the configuration hash, so later --resume calls can safely complete other seeds."
-        ),
-    )
-    parser.add_argument(
-        "--test_modes",
-        type=str,
-        default=None,
-        metavar="MODE[,MODE...]",
-        help=(
-            "Restrict rerank_test/evaluate to configured test modes, for example "
-            "generic,evidence,structure,full. Omit to run all configured modes."
-        ),
-    )
-    parser.add_argument(
         "--smoke",
         type=int,
         default=0,
@@ -1708,15 +1610,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         config["workspace"] = str(config["smoke_workspace"])
     paths = Paths.from_config(root, config)
 
-    test_mode_filter: Optional[List[str]] = None
-    if args.test_modes is not None:
-        test_mode_filter = [value.strip() for value in args.test_modes.split(",") if value.strip()]
-        if not test_mode_filter:
-            parser.error("--test_modes must contain at least one mode.")
-        invalid_modes = [value for value in test_mode_filter if value not in RERANK_MODES]
-        if invalid_modes:
-            parser.error(f"Invalid --test_modes value(s): {invalid_modes}")
-
     runner = PipelineRunner(
         root=root,
         config=config,
@@ -1725,8 +1618,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         overwrite=bool(args.overwrite),
         resume=bool(args.resume),
         smoke_records_per_split=int(args.smoke),
-        test_seed_filter=args.test_seed,
-        test_mode_filter=test_mode_filter,
     )
 
     stages = _selected_stages(args.stage, args.through)
@@ -1740,10 +1631,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(f"Mode: smoke ({args.smoke} development + {args.smoke} test records)")
     else:
         print("Mode: full")
-    if runner.test_seed_filter:
-        print(f"Test seed filter: {list(runner.test_seed_filter)}")
-    if runner.test_mode_filter:
-        print(f"Test mode filter: {list(runner.test_mode_filter)}")
 
     if not args.plan:
         paths.workspace.mkdir(parents=True, exist_ok=True)
@@ -1752,12 +1639,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         STAGE_FUNCTIONS[stage](runner)
         stage_state = runner.state.setdefault("stages", {}).setdefault(stage, {})
         if not runner.plan_only:
-            if stage in {"rerank_test", "evaluate"} and _filtered_test_scope(runner):
-                stage_state["status"] = "succeeded_filtered"
-                stage_state["selected_test_seeds"] = _selected_test_seeds(runner)
-                stage_state["selected_test_modes"] = _selected_test_modes(runner)
-            else:
-                stage_state["status"] = "succeeded"
+            stage_state["status"] = "succeeded"
             stage_state["finished_utc"] = _utc_now()
             runner.save_state()
 
